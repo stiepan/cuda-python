@@ -32,15 +32,15 @@ cdef extern from "include/layout.hpp":
 
 
 cdef enum Property:
-    PROP_IS_UNIQUE = 0
-    PROP_IS_CONTIGUOUS_C = 1
-    PROP_IS_CONTIGUOUS_F = 2
-    PROP_IS_CONTIGUOUS_ANY = 3
-    PROP_REQUIRED_SIZE_IN_BYTES = 4
-    PROP_SHAPE = 5
-    PROP_STRIDES = 6
-    PROP_STRIDES_IN_BYTES = 7
-    PROP_STRIDE_ORDER = 8
+    PROP_IS_UNIQUE = 1
+    PROP_IS_CONTIGUOUS_C = 2
+    PROP_IS_CONTIGUOUS_F = 4
+    PROP_IS_CONTIGUOUS_ANY = 8
+    PROP_REQUIRED_SIZE_IN_BYTES = 16
+    PROP_SHAPE = 32
+    PROP_STRIDES = 64
+    PROP_STRIDES_IN_BYTES = 128
+    PROP_STRIDE_ORDER = 256
 
 
 @cython.final
@@ -390,12 +390,11 @@ cdef class StridedLayout:
             keep_dim,
             axis
         )
-        if vec_size > 1:
-            out_layout.itemsize = itemsize
-            out_layout.volume = self.volume // vec_size
-            out_layout.ndim = out_layout.shape.size()
-        else:
-            copy_layout(out_layout, self)
+        if vec_size <= 1:
+            raise AssertionError("Nothing to pack")
+        out_layout.itemsize = itemsize
+        out_layout.volume = self.volume // vec_size
+        out_layout.ndim = out_layout.shape.size()
         return vec_size
 
     cdef int pack_inplace(StridedLayout self, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=-1) except -1 nogil:
@@ -441,13 +440,12 @@ cdef class StridedLayout:
             itemsize,
             axis
         )
-        if vec_size > 1:
-            out_layout.itemsize = itemsize
-            out_layout.volume = overflow_checked_mul(self.volume, vec_size)
-            out_layout.slice_offset = overflow_checked_mul(self.slice_offset, vec_size)
-            out_layout.ndim = out_layout.shape.size()
-        else:
-            copy_layout(out_layout, self)
+        if vec_size <= 1:
+            raise AssertionError("Nothing to unpack")
+        out_layout.itemsize = itemsize
+        out_layout.volume = overflow_checked_mul(self.volume, vec_size)
+        out_layout.slice_offset = overflow_checked_mul(self.slice_offset, vec_size)
+        out_layout.ndim = out_layout.shape.size()
         return vec_size
     
     cdef int unpack_inplace(StridedLayout self, int itemsize, int axis=-1) except -1 nogil:
@@ -563,23 +561,23 @@ cdef class StridedLayout:
 # ==============================
 
 cdef inline bint has_valid_property(StridedLayout self, Property prop) except -1 nogil:
-    return self._prop_mask & (1 << prop)
+    return self._prop_mask & prop
 
 
 cdef inline bint mark_property_valid(StridedLayout self, Property prop) except -1 nogil:
-    self._prop_mask |= 1 << prop
+    self._prop_mask |= prop
     return 0
 
 
 cdef inline bint boolean_property(StridedLayout self, Property prop) except -1 nogil:
-    return self._boolean_props & (1 << prop)
+    return self._boolean_props & prop
 
 
 cdef inline bint set_boolean_property(StridedLayout self, Property prop, bint value) except -1 nogil:
     if value:
-        self._boolean_props |= 1 << prop
+        self._boolean_props |= prop
     else:
-        self._boolean_props &= ~(1 << prop)
+        self._boolean_props &= ~prop
     mark_property_valid(self, prop)
     return value
 
@@ -634,18 +632,6 @@ cdef inline int setup_itemsize(StridedLayout layout, int itemsize) except -1 nog
         raise ValueError("itemsize must be a power of two")
     layout.itemsize = itemsize
     return 0
-
-
-cdef inline int copy_layout(StridedLayout out_layout, StridedLayout in_layout) except -1 nogil:
-    out_layout._prop_mask = 0
-    out_layout.itemsize = in_layout.itemsize
-    out_layout.slice_offset = in_layout.slice_offset
-    out_layout.volume = in_layout.volume
-    out_layout.ndim = in_layout.ndim
-    out_layout.shape = in_layout.shape
-    out_layout.strides = in_layout.strides
-    return 0
-
 
 # ==============================
 # Implementation details - python <-> C conversions
