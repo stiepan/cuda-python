@@ -288,11 +288,11 @@ cdef class StridedLayout:
        # Reset all memoized properties
         out_layout._prop_mask = 0
 
-        # Reshaping preserves the slice-offset
+        # Copy preserved attributes
         out_layout.slice_offset = self.slice_offset
+        out_layout.itemsize = self.itemsize
 
         setup_reshaped_shape(out_layout, shape, self.volume)
-        setup_itemsize(out_layout, self.itemsize)
         zeros(out_layout.strides, out_layout.ndim)
 
         if out_layout.volume != self.volume:
