@@ -8,7 +8,14 @@ from cython.operator cimport dereference as deref
 from libc.stdint cimport int64_t, uint32_t, intptr_t
 from libcpp cimport vector
 
+from cpython.object cimport PyObject
+
 from cuda.core.experimental._utils cimport cuda_utils
+
+
+cdef extern from "Python.h":
+    int _PySlice_Unpack "PySlice_Unpack" (PyObject *slice, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t *step) except -1
+    Py_ssize_t _PySlice_AdjustIndices "PySlice_AdjustIndices" (Py_ssize_t length, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t step) noexcept nogil
 
 
 ctypedef fused vector_t:
@@ -146,11 +153,10 @@ cdef class StridedLayout:
         return self.get_max_compatible_itemsize(max_itemsize, data_ptr, axis)
     
     def sliced(self, object slices):
-        cdef slices_t slices_vec
-        if slices2slices_t(slices_vec, slices):
-            return self
+        if not isinstance(slices, tuple):
+            slices = (slices,)
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
-        self.slice_into(new_layout, slices_vec)
+        self.slice_into(new_layout, slices)
         return new_layout
     
     def __getitem__(StridedLayout self, object slices):
@@ -367,6 +373,7 @@ cdef class StridedLayout:
             keep_dim,
             axis
         )
+        cdef int64_t new_volume = self.volume // vec_size
 
         if vec_size == 1 and out_layout is self:
             return 0
@@ -376,7 +383,7 @@ cdef class StridedLayout:
 
         # Set new attributes
         out_layout.itemsize = itemsize
-        out_layout.volume = self.volume // vec_size
+        out_layout.volume = new_volume
         out_layout.ndim = new_shape.size()
         out_layout.slice_offset = new_slice_offset
         swap(out_layout.shape, new_shape)
@@ -398,29 +405,39 @@ cdef class StridedLayout:
         if vec_size == 1 and out_layout is self:
             return 0
         
+        cdef int64_t new_volume = overflow_checked_mul(self.volume, vec_size)
+        cdef int64_t new_slice_offset = overflow_checked_mul(self.slice_offset, vec_size)
+        
         # Reset all memoized properties
         out_layout._prop_mask = 0
 
         # Set new attributes
         out_layout.itemsize = itemsize
-        out_layout.volume = overflow_checked_mul(self.volume, vec_size)
+        out_layout.volume = new_volume
         out_layout.ndim = new_shape.size()
-        out_layout.slice_offset = overflow_checked_mul(self.slice_offset, vec_size)
+        out_layout.slice_offset = new_slice_offset
         swap(out_layout.shape, new_shape)
         swap(out_layout.strides, new_strides)
         return vec_size
     
-    cdef int slice_into(StridedLayout self, StridedLayout out_layout, slices_t& slices) except -1 nogil:
+    cdef int slice_into(StridedLayout self, StridedLayout out_layout, tuple slices) except -1:
+        cdef shape_t new_shape
+        cdef strides_t new_strides
+        cdef stride_t slice_offset = slice_extents(new_shape, new_strides, self.shape, self.strides, slices)
+        cdef int64_t new_volume = volume(new_shape)
+        cdef int64_t new_slice_offset = overflow_checked_sum(self.slice_offset, slice_offset)
+
         # Reset all memoized properties
         out_layout._prop_mask = 0
 
         # Preserved attributes
         out_layout.itemsize = self.itemsize
-
-        cdef stride_t slice_offset = slice_extents(out_layout.shape, out_layout.strides, self.shape, self.strides, slices)
-        out_layout.slice_offset = overflow_checked_sum(self.slice_offset, slice_offset)
-        out_layout.volume = volume(out_layout.shape)
-        out_layout.ndim = out_layout.shape.size()
+        
+        out_layout.ndim = new_shape.size()
+        out_layout.volume = new_volume
+        out_layout.slice_offset = new_slice_offset
+        swap(out_layout.shape, new_shape)
+        swap(out_layout.strides, new_strides)
         return 0
 
     cdef int get_stride_order(StridedLayout self, axis_order_t& stride_order) except -1 nogil:
@@ -571,41 +588,6 @@ cdef inline axes_mask_t axis_mask_from_range(int ndim, int start_axis, int end_a
     if end_axis < ndim:
         axis_mask &= (AXIS_MASK_ALL >> (STRIDED_LAYOUT_MAX_NDIM - end_axis - 1))
     return axis_mask
-
-
-cdef inline int slice2slice_struct(Slice& c_slice, object py_slice) except -1:
-    c_slice.mask = 0
-    if isinstance(py_slice, int):
-        c_slice.mask = SLICE_PROP_SINGLE_ELEMENT
-        c_slice.start = py_slice
-        return 0
-    elif isinstance(py_slice, slice):
-        if py_slice.start is not None:
-            c_slice.start = py_slice.start
-            c_slice.mask |= SLICE_PROP_START
-        if py_slice.stop is not None:
-            c_slice.stop = py_slice.stop
-            c_slice.mask |= SLICE_PROP_STOP
-        if py_slice.step is not None:
-            c_slice.step = py_slice.step
-            c_slice.mask |= SLICE_PROP_STEP
-        return 0
-    
-    raise ValueError(f"Invalid slice: {py_slice}. Expected slice instance or tuple/list of slices.")
-
-
-cdef bint slices2slices_t(slices_t& slices, object py_slice) except -1:
-    cdef slice_mask_t mask = 0
-    if isinstance(py_slice, tuple | list):
-        slices.resize(len(py_slice))
-        for i in range(len(py_slice)):
-            slice2slice_struct(slices[i], py_slice[i])
-            mask |= slices[i].mask
-        return mask == 0
-    else:
-        slices.resize(1)
-        slice2slice_struct(slices[0], py_slice)
-        return slices[0].mask == 0
 
 
 cdef inline int validate_reshaped_shape(shape_t& new_shape, int64_t old_volume) except -1 nogil:
@@ -1048,98 +1030,44 @@ cdef inline int max_compatible_itemsize(stride_t slice_offset, int itemsize, sha
     return max_itemsize
 
 
-cdef inline int64_t normalize_clamp_index(int64_t index, int64_t extent, bint has_negative_step) except? -1 nogil:
-    # first translate negative indexing to respective positive one
-    if index < 0:
-        index += extent
-    # then clamp the index
-    # * for positive step, [0, extent] is the valid range, where:
-    #   * start=extent indicates no elements should be taken 
-    #   * and stop=extent indicates no trimming from the end
-    # * for negative step, the respective valid range is [-1, extent-1], where:
-    #   * start=-1 indicates no elements should be taken
-    #   * and stop=-1 indicates no trimming from the end,
-    #   but there's no way to specify -1 explicitly 
-    #   (as -1 is first translated to last element, i.e. extent-1)
-    if index < 0:
-        index = 0
-    elif index >= extent:
-        if has_negative_step:
-            index = extent - 1
-        else:
-            index = extent
-    return index
-
-
-cdef inline int slice_extent(stride_t& out_slice_offset, extent_t& out_extent, stride_t& out_stride, Slice& slice, extent_t extent, stride_t stride) except -1 nogil:
-    cdef int64_t step
-    cdef bint has_negative_step
-    cdef int64_t start
-    cdef int64_t stop
-    if slice.mask & SLICE_PROP_STEP:
-        step = slice.step
-        if step == 0:
-            raise ValueError("The slice step cannot be zero.")
-    else:
-        step = 1
-    has_negative_step = step < 0
-    if slice.mask & SLICE_PROP_START:
-        start = normalize_clamp_index(slice.start, extent, has_negative_step)
-    else:
-        start = extent - 1 if has_negative_step else 0
-    if slice.mask & SLICE_PROP_STOP:
-        stop = normalize_clamp_index(slice.stop, extent, has_negative_step)
-    else:
-        stop = -1 if has_negative_step else extent
-    # start and stop are now in [0, extent] range for positive step,
-    # and [-1, extent - 1] for negative step
-    cdef extent_t extents_range
-    extents_range = overflow_checked_diff(start, stop) if has_negative_step else overflow_checked_diff(stop, start)
-    if extents_range < 0:
-        extents_range = 0
-    out_extent = overflow_checked_div_ceil(extents_range, c_abs(step))
-    if out_extent <= 0:
-        out_slice_offset = 0
-    else:
-        # out_extent > 0 implies start is in [0, extent - 1] range
-        out_slice_offset = overflow_checked_mul(start, stride)
-    out_stride = overflow_checked_mul(step, stride)
-    return 0
-
-
-cdef inline stride_t slice_extents(shape_t& out_shape, strides_t& out_strides, shape_t& shape, strides_t& strides, slices_t& slices) except? -1 nogil:
+cdef inline stride_t slice_extents(shape_t& out_shape, strides_t& out_strides, shape_t& shape, strides_t& strides, tuple slices) except? -1:
     cdef int ndim = shape.size()
-    cdef int num_slices = slices.size()
+    cdef int num_slices = len(slices)
     if num_slices > ndim:
         raise ValueError(f"The number of slices ({num_slices}) is greater than the number of dimensions ({ndim}).")
     out_shape.clear()
     out_shape.reserve(ndim)
     out_strides.clear()
     out_strides.reserve(ndim)
-    cdef extent_t extent
-    cdef int64_t start
-    cdef extent_t new_extent = 0
-    cdef extent_t new_stride = 0
     cdef stride_t slice_offset = 0
-    cdef stride_t extent_slice_offset = 0
+    cdef extent_t extent
+    cdef stride_t stride
+    cdef Py_ssize_t start
+    cdef Py_ssize_t stop
+    cdef Py_ssize_t step
+    cdef extent_t new_extent
+    cdef object py_slice
     for i in range(num_slices):
         extent = shape[i]
-        if slices[i].mask == 0:
-            out_shape.push_back(shape[i])
-            out_strides.push_back(strides[i])
-        elif slices[i].mask & SLICE_PROP_SINGLE_ELEMENT:
-            start = slices[i].start
-            # the single index must be in [0, extent) range
-            # ([-extent, -1] are valid too and translated to [0, extent-1] range)
-            if not normalize_axis(start, shape[i]):
+        stride = strides[i]
+        py_slice = slices[i]
+        if isinstance(py_slice, int):
+            start = py_slice
+            if not normalize_axis(start, extent):
                 raise ValueError(f"Invalid index: {start} out of range for axis {i} with extent {extent}")
-            slice_offset = overflow_checked_sum(slice_offset, overflow_checked_mul(start, strides[i]))
-            # single element index removes extent from the shape
-        else:
-            slice_extent(extent_slice_offset, new_extent, new_stride, slices[i], shape[i], strides[i])
-            slice_offset = overflow_checked_sum(slice_offset, extent_slice_offset)
+            # single element index removes extent from the shape,
+            # just increase the offset and skip the shape and stride
+            slice_offset = overflow_checked_sum(slice_offset, overflow_checked_mul(start, stride))
+        elif isinstance(py_slice, slice):
+            _PySlice_Unpack(<PyObject *>py_slice, &start, &stop, &step)
+            new_extent = _PySlice_AdjustIndices(extent, &start, &stop, step)
+            if new_extent > 0:
+                # out_extent > 0 implies start is in [0, extent - 1] range
+                slice_offset = overflow_checked_sum(slice_offset, overflow_checked_mul(start, stride))
             out_shape.push_back(new_extent)
-            out_strides.push_back(new_stride)
+            out_strides.push_back(overflow_checked_mul(stride, step))
+        else:
+            raise ValueError(f"Invalid slice: {py_slice}. Expected slice instance or integer.")
     for i in range(num_slices, ndim):
         out_shape.push_back(shape[i])
         out_strides.push_back(strides[i])

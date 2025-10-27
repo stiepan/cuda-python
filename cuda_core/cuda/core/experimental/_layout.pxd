@@ -25,25 +25,6 @@ cdef enum OrderFlag:
     ORDER_PERM = 3
 
 
-cdef enum SliceMask:
-    SLICE_PROP_SINGLE_ELEMENT = 1
-    SLICE_PROP_START = 2
-    SLICE_PROP_STOP = 4
-    SLICE_PROP_STEP = 8
-
-
-ctypedef uint32_t slice_mask_t
-
-cdef struct Slice:
-    int64_t start
-    int64_t stop
-    int64_t step
-    slice_mask_t mask
-
-
-ctypedef vector.vector[Slice] slices_t
-
-
 @cython.final
 cdef class StridedLayout:
 
@@ -90,7 +71,7 @@ cdef class StridedLayout:
     cdef int squeeze_into(StridedLayout self, StridedLayout out_layout) except -1 nogil
     cdef int pack_into(StridedLayout self, StridedLayout out_layout, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=*) except -1 nogil
     cdef int unpack_into(StridedLayout self, StridedLayout out_layout, int itemsize, int axis=*) except -1 nogil
-    cdef int slice_into(StridedLayout self, StridedLayout out_layout, slices_t& slices) except -1 nogil
+    cdef int slice_into(StridedLayout self, StridedLayout out_layout, tuple slices) except -1
 
     # Properties
     cdef int get_stride_order(StridedLayout self, axis_order_t& stride_order) except -1 nogil
