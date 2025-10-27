@@ -1154,7 +1154,7 @@ cdef inline int64_t normalize_clamp_index(int64_t index, int64_t extent, bint ha
     return index
 
 
-cdef inline int slice_extent(stride_t& acc_slice_offset, extent_t& out_extent, stride_t& out_stride, Slice& slice, extent_t extent, stride_t stride) except -1 nogil:
+cdef inline int slice_extent(stride_t& out_slice_offset, extent_t& out_extent, stride_t& out_stride, Slice& slice, extent_t extent, stride_t stride) except -1 nogil:
     cdef int64_t step
     cdef bint has_negative_step
     cdef int64_t start
@@ -1181,12 +1181,11 @@ cdef inline int slice_extent(stride_t& acc_slice_offset, extent_t& out_extent, s
     if extents_range < 0:
         extents_range = 0
     out_extent = overflow_checked_div_ceil(extents_range, c_abs(step))
-    if out_extent > 0:
-        # if start is not in [0, extent - 1] range, the
-        # out_extent will be 0, so this way we avoid modifying 
-        # offset with invalid start index, even though for
-        # zero-volume layout, strides and offsets won't be used anyway
-        acc_slice_offset = overflow_checked_sum(acc_slice_offset, overflow_checked_mul(start, stride))
+    if out_extent <= 0:
+        out_slice_offset = 0
+    else:
+        # out_extent > 0 implies start is in [0, extent - 1] range
+        out_slice_offset = overflow_checked_mul(start, stride)
     out_stride = overflow_checked_mul(step, stride)
     return 0
 
@@ -1205,6 +1204,7 @@ cdef inline stride_t slice_extents(shape_t& out_shape, strides_t& out_strides, s
     cdef extent_t new_extent = 0
     cdef extent_t new_stride = 0
     cdef stride_t slice_offset = 0
+    cdef stride_t extent_slice_offset = 0
     for i in range(num_slices):
         extent = shape[i]
         if slices[i].mask == 0:
@@ -1216,10 +1216,11 @@ cdef inline stride_t slice_extents(shape_t& out_shape, strides_t& out_strides, s
             # ([-extent, -1] are valid too and translated to [0, extent-1] range)
             if not normalize_axis(start, shape[i]):
                 raise ValueError(f"Invalid index: {start} out of range for axis {i} with extent {extent}")
-            acc_slice_offset = overflow_checked_sum(acc_slice_offset, overflow_checked_mul(start, strides[i]))
+            slice_offset = overflow_checked_sum(slice_offset, overflow_checked_mul(start, strides[i]))
             # single element index removes extent from the shape
         else:
-            slice_extent(slice_offset, new_extent, new_stride, slices[i], shape[i], strides[i])
+            slice_extent(extent_slice_offset, new_extent, new_stride, slices[i], shape[i], strides[i])
+            slice_offset = overflow_checked_sum(slice_offset, extent_slice_offset)
             out_shape.push_back(new_extent)
             out_strides.push_back(new_stride)
     for i in range(num_slices, ndim):
