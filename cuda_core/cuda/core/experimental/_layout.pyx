@@ -113,25 +113,12 @@ cdef class StridedLayout:
         tuple2vec(axis_order_vec, axis_order)
         self.permute_into(new_layout, axis_order_vec)
         return new_layout
-    
-    def _permute(self, object axis_order):
-        # TODO(ktokarski) Remove me, Python API should not be able
-        # to mutate the layout in place
-        cdef axis_order_t axis_order_vec
-        tuple2vec(axis_order_vec, axis_order)
-        self.permute_inplace(axis_order_vec)
-        return self
 
     def flattened(self, start_axis=0, end_axis=-1, mask=None):
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         cdef axes_mask_t axis_mask = mask if mask is not None else axis_mask_from_range(self.ndim, start_axis, end_axis)
         self.flatten_into(new_layout, axis_mask)
         return new_layout
-    
-    def _flatten(self, start_axis=0, end_axis=-1, mask=None):
-        cdef axes_mask_t axis_mask = mask if mask is not None else axis_mask_from_range(self.ndim, start_axis, end_axis)
-        self.flatten_inplace(axis_mask)
-        return self
     
     def flattened_axis_mask(self):
         return self.get_flattened_axis_mask()
@@ -141,10 +128,6 @@ cdef class StridedLayout:
         self.squeeze_into(new_layout)
         return new_layout
     
-    def _squeeze(self):
-        self.squeeze_inplace()
-        return self
-    
     def packed(self, int itemsize, intptr_t data_ptr=0, int axis=-1, bint keep_dim=True):
         if itemsize == self.itemsize:
             return self
@@ -152,21 +135,12 @@ cdef class StridedLayout:
         self.pack_into(new_layout, itemsize, data_ptr, keep_dim, axis)
         return new_layout
     
-    def _pack(self, int itemsize, intptr_t data_ptr=0, int axis=-1, bint keep_dim=True):
-        if itemsize != self.itemsize:
-            self.pack_inplace(itemsize, data_ptr, keep_dim, axis)
-        return self
-    
     def unpacked(self, int itemsize, int axis=-1):
         if itemsize == self.itemsize:
             return self
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         self.unpack_into(new_layout, itemsize, axis)
         return new_layout
-    
-    def _unpack(self, int itemsize, int axis=-1):
-        self.unpack_inplace(itemsize, axis)
-        return self
     
     def max_compatible_itemsize(self, int max_itemsize=16, intptr_t data_ptr=0, int axis=-1):
         return self.get_max_compatible_itemsize(max_itemsize, data_ptr, axis)
@@ -178,12 +152,6 @@ cdef class StridedLayout:
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         self.slice_into(new_layout, slices_vec)
         return new_layout
-    
-    def _slice(self, object slices):
-        cdef slices_t slices_vec
-        slices2slices_t(slices_vec, slices)
-        self.slice_inplace(slices_vec)
-        return self
     
     def __getitem__(StridedLayout self, object slices):
         return self.sliced(slices)    
@@ -287,31 +255,41 @@ cdef class StridedLayout:
             zeros(self.strides, self.ndim)
         return volume
     
-    cdef int reshape_into(StridedLayout self, StridedLayout out_layout, shape_t& shape) except -1 nogil:
-       # Reset all memoized properties
+    cdef int reshape_into(StridedLayout self, StridedLayout out_layout, shape_t& new_shape) except -1 nogil:
+        validate_reshaped_shape(new_shape, self.volume)
+        
+        cdef int ndim = new_shape.size()
+        cdef strides_t new_strides
+        zeros(new_strides, ndim)
+
+        cdef shape_t flattened_shape
+        cdef strides_t flattened_strides
+        if self.volume != 0:
+            flatten_strides_in_c_index_order(flattened_shape, flattened_strides, self.shape, self.strides, AXIS_MASK_ALL)
+            if not split_strides_in_c_index_order(new_shape, new_strides, flattened_shape, flattened_strides):
+                raise ValueError("Layout strides are incompatible with the new shape")
+        
+        # Reset all memoized properties
         out_layout._prop_mask = 0
 
         # Copy preserved attributes
         out_layout.slice_offset = self.slice_offset
         out_layout.itemsize = self.itemsize
+        out_layout.volume = self.volume
 
-        setup_reshaped_shape(out_layout, shape, self.volume)
-        zeros(out_layout.strides, out_layout.ndim)
-
-        if out_layout.volume != self.volume:
-            raise ValueError("The new shape has different volume from the reshaped layout. The new volume is {out_layout.volume} and the original volume is {self.volume}.")
-        elif out_layout.volume == 0:
-            return 0
-        cdef shape_t flattened_shape
-        cdef strides_t flattened_strides
-        flatten_strides_in_c_index_order(flattened_shape, flattened_strides, self.shape, self.strides, AXIS_MASK_ALL)
-        if not split_strides_in_c_index_order(out_layout.shape, out_layout.strides, flattened_shape, flattened_strides):
-            raise ValueError("Layout strides are incompatible with the new shape")
+        # Set new attributes
+        out_layout.ndim = ndim
+        swap(out_layout.shape, new_shape)
+        swap(out_layout.strides, new_strides)
         return 0
     
     cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_order_t& axis_order) except -1 nogil:
         if axis_order.size() != <size_t>self.ndim:
             raise ValueError(f"Permutation must have the same length as the number of dimensions, got {axis_order.size()} for {self.ndim}D tensor.")
+
+        cdef shape_t new_shape
+        cdef strides_t new_strides
+        permute_extents(new_shape, new_strides, self.shape, self.strides, axis_order)
 
         # Reset all memoized properties
         out_layout._prop_mask = 0
@@ -322,23 +300,19 @@ cdef class StridedLayout:
         out_layout.volume = self.volume
         out_layout.slice_offset = self.slice_offset
 
-        permute_extents(out_layout.shape, out_layout.strides, self.shape, self.strides, axis_order)
+        # Set new attributes
+        swap(out_layout.shape, new_shape)
+        swap(out_layout.strides, new_strides)
         return 0
     
-    cdef int permute_inplace(StridedLayout self, axis_order_t& axis_order) except -1 nogil:
-        if axis_order.size() != <size_t>self.ndim:
-            raise ValueError(f"Permutation must have the same length as the number of dimensions, got {axis_order.size()} for {self.ndim}D tensor.")
-        
-        # Reset all memoized properties
-        self._prop_mask = 0
-
+    cdef int flatten_into(StridedLayout self, StridedLayout out_layout, axes_mask_t axis_mask=AXIS_MASK_ALL) except -1 nogil:
         cdef shape_t new_shape
         cdef strides_t new_strides
-        permute_extents(new_shape, new_strides, self.shape, self.strides, axis_order)
-        swap(self.shape, new_shape)
-        swap(self.strides, new_strides)
-    
-    cdef int flatten_into(StridedLayout self, StridedLayout out_layout, axes_mask_t axis_mask=AXIS_MASK_ALL) except -1 nogil:
+        cdef int ndim = flatten_strides_in_c_index_order(new_shape, new_strides, self.shape, self.strides, axis_mask)
+
+        if out_layout is self and ndim == self.ndim:
+            return 0
+
         # Reset all memoized properties
         out_layout._prop_mask = 0
 
@@ -347,17 +321,20 @@ cdef class StridedLayout:
         out_layout.volume = self.volume
         out_layout.slice_offset = self.slice_offset
 
-        out_layout.ndim = flatten_strides_in_c_index_order(out_layout.shape, out_layout.strides, self.shape, self.strides, axis_mask)
-        return 0
-    
-    cdef int flatten_inplace(StridedLayout self, axes_mask_t axis_mask=AXIS_MASK_ALL) except -1 nogil:
-        # Reset all memoized properties
-        self._prop_mask = 0
-
-        self.ndim = flatten_strides_in_c_index_order(self.shape, self.strides, self.shape, self.strides, axis_mask)
+        # Set new attributes
+        out_layout.ndim = ndim
+        swap(out_layout.shape, new_shape)
+        swap(out_layout.strides, new_strides)
         return 0
     
     cdef int squeeze_into(StridedLayout self, StridedLayout out_layout) except -1 nogil:
+        cdef shape_t new_shape
+        cdef strides_t new_strides
+        cdef int ndim = squeeze_extents(new_shape, new_strides, self.shape, self.strides)
+        
+        if out_layout is self and ndim == self.ndim:
+            return 0
+
         # Reset all memoized properties
         out_layout._prop_mask = 0
 
@@ -366,51 +343,17 @@ cdef class StridedLayout:
         out_layout.volume = self.volume
         out_layout.slice_offset = self.slice_offset
 
-        out_layout.ndim = squeeze_extents(out_layout.shape, out_layout.strides, self.shape, self.strides)
-        return 0
-    
-    cdef int squeeze_inplace(StridedLayout self) except -1 nogil:
-        # Reset all memoized properties
-        self._prop_mask = 0
-
-        self.ndim = squeeze_extents(self.shape, self.strides, self.shape, self.strides)
+        # Set new attributes
+        out_layout.ndim = ndim
+        swap(out_layout.shape, new_shape)
+        swap(out_layout.strides, new_strides)
         return 0
 
     cdef int pack_into(StridedLayout self, StridedLayout out_layout, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=-1) except -1 nogil:
-        # Reset all memoized properties
-        out_layout._prop_mask = 0
-
-        cdef int vec_size = pack_extents(
-            out_layout.slice_offset,
-            out_layout.shape,
-            out_layout.strides,
-            self.slice_offset,
-            self.shape,
-            self.strides,
-            self.itemsize,
-            itemsize,
-            data_ptr,
-            keep_dim,
-            axis
-        )
-        if vec_size <= 1:
-            raise AssertionError("Nothing to pack")
-        out_layout.itemsize = itemsize
-        out_layout.volume = self.volume // vec_size
-        out_layout.ndim = out_layout.shape.size()
-        return vec_size
-
-    cdef int pack_inplace(StridedLayout self, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=-1) except -1 nogil:
-        """
-        Vectorizes the layout: i.e. multiplies the itemsize by vec_size
-        and divides the strides and last extent by the vector size.
-        """
-        # Reset all memoized properties
-        self._prop_mask = 0
-
-        cdef stride_t new_slice_offset = 0
+        
         cdef shape_t new_shape
         cdef strides_t new_strides
+        cdef stride_t new_slice_offset = 0
         cdef int vec_size = pack_extents(
             new_slice_offset,
             new_shape,
@@ -424,38 +367,25 @@ cdef class StridedLayout:
             keep_dim,
             axis
         )
-        if vec_size > 1:
-            self.itemsize = itemsize
-            self.slice_offset = new_slice_offset
-            self.volume = self.volume // vec_size
-            self.ndim = new_shape.size()
-            swap(self.shape, new_shape)
-            swap(self.strides, new_strides)
+
+        if vec_size == 1 and out_layout is self:
+            return 0
+
+        # Reset all memoized properties
+        out_layout._prop_mask = 0
+
+        # Set new attributes
+        out_layout.itemsize = itemsize
+        out_layout.volume = self.volume // vec_size
+        out_layout.ndim = new_shape.size()
+        out_layout.slice_offset = new_slice_offset
+        swap(out_layout.shape, new_shape)
+        swap(out_layout.strides, new_strides)
         return vec_size
     
     cdef int unpack_into(StridedLayout self, StridedLayout out_layout, int itemsize, int axis=-1) except -1 nogil:
-        cdef int vec_size = unpack_extents(
-            out_layout.shape,
-            out_layout.strides,
-            self.shape,
-            self.strides,
-            self.itemsize,
-            itemsize,
-            axis
-        )
-        if vec_size <= 1:
-            raise AssertionError("Nothing to unpack")
-        out_layout.itemsize = itemsize
-        out_layout.volume = overflow_checked_mul(self.volume, vec_size)
-        out_layout.slice_offset = overflow_checked_mul(self.slice_offset, vec_size)
-        out_layout.ndim = out_layout.shape.size()
-        return vec_size
-    
-    cdef int unpack_inplace(StridedLayout self, int itemsize, int axis=-1) except -1 nogil:
         cdef shape_t new_shape
         cdef strides_t new_strides
-        cdef stride_t new_slice_offset = 0
-        cdef int64_t new_volume = 0
         cdef int vec_size = unpack_extents(
             new_shape,
             new_strides,
@@ -465,15 +395,19 @@ cdef class StridedLayout:
             itemsize,
             axis
         )
-        if vec_size > 1:
-            new_slice_offset = overflow_checked_mul(self.slice_offset, vec_size)
-            new_volume = overflow_checked_mul(self.volume, vec_size)
-            self.itemsize = itemsize
-            self.volume = new_volume
-            self.slice_offset = new_slice_offset
-            self.ndim = new_shape.size()
-            swap(self.shape, new_shape)
-            swap(self.strides, new_strides)
+        if vec_size == 1 and out_layout is self:
+            return 0
+        
+        # Reset all memoized properties
+        out_layout._prop_mask = 0
+
+        # Set new attributes
+        out_layout.itemsize = itemsize
+        out_layout.volume = overflow_checked_mul(self.volume, vec_size)
+        out_layout.ndim = new_shape.size()
+        out_layout.slice_offset = overflow_checked_mul(self.slice_offset, vec_size)
+        swap(out_layout.shape, new_shape)
+        swap(out_layout.strides, new_strides)
         return vec_size
     
     cdef int slice_into(StridedLayout self, StridedLayout out_layout, slices_t& slices) except -1 nogil:
@@ -487,19 +421,6 @@ cdef class StridedLayout:
         out_layout.slice_offset = overflow_checked_sum(self.slice_offset, slice_offset)
         out_layout.volume = volume(out_layout.shape)
         out_layout.ndim = out_layout.shape.size()
-        return 0
-    
-    cdef int slice_inplace(StridedLayout self, slices_t& slices) except -1 nogil:
-        # Reset all memoized properties
-        self._prop_mask = 0
-
-        cdef shape_t new_shape
-        cdef strides_t new_strides
-        self.slice_offset = overflow_checked_sum(self.slice_offset, slice_extents(new_shape, new_strides, self.shape, self.strides, slices))
-        self.volume = volume(new_shape)
-        swap(self.shape, new_shape)
-        swap(self.strides, new_strides)
-        self.ndim = self.shape.size()
         return 0
 
     cdef int get_stride_order(StridedLayout self, axis_order_t& stride_order) except -1 nogil:
@@ -598,36 +519,6 @@ cdef inline int setup_shape(StridedLayout layout, shape_t& shape) except -1 nogi
     return 0
 
 
-cdef inline int setup_reshaped_shape(StridedLayout layout, shape_t& shape, int64_t previous_volume) except -1 nogil:
-    cdef int ndim = shape.size()
-    if ndim > STRIDED_LAYOUT_MAX_NDIM:
-        raise ValueError(f"Unsupported number of dimensions: {ndim}. Max supported ndim is {STRIDED_LAYOUT_MAX_NDIM}")
-    cdef int axis = -1
-    cdef extent_t extent
-    cdef int64_t new_volume = 1
-    for i in range(ndim):
-        extent = shape[i]
-        if extent < -1:
-            raise ValueError("Extents must be non-negative")
-        elif extent == -1:
-            if axis == -1:
-                axis = i
-            else:
-                raise ValueError("There can be at most one -1 extent in a shape")
-    new_volume = c_abs(volume(shape))
-    if axis != -1:
-        extent = previous_volume // new_volume
-        if extent * new_volume != previous_volume:
-            raise ValueError(f"The original volume {previous_volume} must be divisible by the specified sub-volume {new_volume}.")
-        shape[axis] = extent
-    elif new_volume != previous_volume:
-        raise ValueError(f"The original volume {previous_volume} and the new volume {new_volume} must be equal.")
-    layout.volume = previous_volume
-    layout.ndim = ndim
-    swap(layout.shape, shape)
-    return 0
-
-
 cdef inline int setup_itemsize(StridedLayout layout, int itemsize) except -1 nogil:
     if itemsize <= 0:
         raise ValueError("itemsize must be positive")
@@ -716,6 +607,32 @@ cdef bint slices2slices_t(slices_t& slices, object py_slice) except -1:
         slice2slice_struct(slices[0], py_slice)
         return slices[0].mask == 0
 
+
+cdef inline int validate_reshaped_shape(shape_t& new_shape, int64_t old_volume) except -1 nogil:
+    cdef int ndim = new_shape.size()
+    if ndim > STRIDED_LAYOUT_MAX_NDIM:
+        raise ValueError(f"Unsupported number of dimensions: {ndim}. Max supported ndim is {STRIDED_LAYOUT_MAX_NDIM}")
+    cdef int axis = -1
+    cdef extent_t extent
+    cdef int64_t new_volume = 1
+    for i in range(ndim):
+        extent = new_shape[i]
+        if extent < -1:
+            raise ValueError("Extents must be non-negative")
+        elif extent == -1:
+            if axis == -1:
+                axis = i
+            else:
+                raise ValueError("There can be at most one -1 extent in a shape")
+    new_volume = c_abs(volume(new_shape))
+    if new_volume != old_volume:
+        if axis == -1 or new_volume == 0:
+            raise ValueError(f"The original volume {old_volume} and the new volume {new_volume} must be equal.")
+        extent = old_volume // new_volume
+        if extent * new_volume != old_volume:
+            raise ValueError(f"The original volume {old_volume} must be divisible by the specified sub-volume {new_volume}.")
+        new_shape[axis] = extent
+    return 0
 
 # ==============================
 # Implementation details - C helpers

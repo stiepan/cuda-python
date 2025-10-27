@@ -86,17 +86,11 @@ cdef class StridedLayout:
     # Layout manipulation
     cdef int reshape_into(StridedLayout self, StridedLayout out_layout, shape_t& shape) except -1 nogil
     cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_order_t& axis_order) except -1 nogil
-    cdef int permute_inplace(StridedLayout self, axis_order_t& axis_order) except -1 nogil
     cdef int flatten_into(StridedLayout self, StridedLayout out_layout, axes_mask_t axis_mask=*) except -1 nogil
-    cdef int flatten_inplace(StridedLayout self, axes_mask_t axis_mask=*) except -1 nogil
     cdef int squeeze_into(StridedLayout self, StridedLayout out_layout) except -1 nogil
-    cdef int squeeze_inplace(StridedLayout self) except -1 nogil
     cdef int pack_into(StridedLayout self, StridedLayout out_layout, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=*) except -1 nogil
-    cdef int pack_inplace(StridedLayout self, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=*) except -1 nogil
     cdef int unpack_into(StridedLayout self, StridedLayout out_layout, int itemsize, int axis=*) except -1 nogil
-    cdef int unpack_inplace(StridedLayout self, int itemsize, int axis=*) except -1 nogil
     cdef int slice_into(StridedLayout self, StridedLayout out_layout, slices_t& slices) except -1 nogil
-    cdef int slice_inplace(StridedLayout self, slices_t& slices) except -1 nogil
 
     # Properties
     cdef int get_stride_order(StridedLayout self, axis_order_t& stride_order) except -1 nogil
