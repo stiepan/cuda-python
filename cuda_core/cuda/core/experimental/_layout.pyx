@@ -437,14 +437,6 @@ cdef class StridedLayout:
 # Implementation details - python <-> C conversions
 # ==============================
 
-cdef inline int tuple2vec(vector_t &vec, object t) except -1:
-    cdef int ndim = len(t)
-    vec.clear()
-    vec.reserve(ndim)
-    for i in range(ndim):
-        vec.push_back(t[i])
-    return 0
-
 
 cdef inline OrderFlag stride_order2vec(axis_order_t& stride_order_vec, object stride_order) except? ORDER_NONE:
     if stride_order == 'C':
@@ -529,10 +521,9 @@ cdef inline int64_t overflow_checked_div_ceil(int64_t a, int64_t b) except? -1 n
 
 cdef inline int strides_in_bytes(strides_t &out_strides, strides_t &in_strides, int itemsize) except -1 nogil:
     cdef int ndim = in_strides.size()
-    out_strides.clear()
-    out_strides.reserve(ndim)
+    out_strides.resize(ndim)
     for i in range(ndim):
-        out_strides.push_back(overflow_checked_mul(in_strides[i], itemsize))
+        out_strides[i] = overflow_checked_mul(in_strides[i], itemsize)
     return 0
 
 
@@ -698,10 +689,8 @@ cdef inline axes_mask_t flattened_strides_in_c_index_order_mask(shape_t& shape, 
 
 cdef inline int permute_extents(shape_t& out_shape, strides_t& out_strides, shape_t& shape, strides_t& strides, axis_order_t& axis_order) except -1 nogil:
     cdef int ndim = shape.size()
-    out_shape.clear()
-    out_shape.reserve(ndim)
-    out_strides.clear()
-    out_strides.reserve(ndim)
+    out_shape.resize(ndim)
+    out_strides.resize(ndim)
     cdef axes_mask_t axis_order_mask = 0
     cdef axes_mask_t axis_mask
     cdef axis_t axis
@@ -713,8 +702,8 @@ cdef inline int permute_extents(shape_t& out_shape, strides_t& out_strides, shap
         if axis_order_mask & axis_mask:
             raise ValueError(f"Invalid permutation: axis {axis} appears multiple times.")
         axis_order_mask |= axis_mask
-        out_shape.push_back(shape[axis])
-        out_strides.push_back(strides[axis])
+        out_shape[i] = shape[axis]
+        out_strides[i] = strides[axis]
     return 0
 
 

@@ -281,3 +281,11 @@ cdef inline stride_t _dense_strides_in_order(strides_t& strides, shape_t& shape,
         stride *= shape[axis]
         i -= 1
     return stride
+
+
+cdef inline int tuple2vec(vector_t &vec, object t) except -1:
+    cdef int ndim = len(t)
+    vec.resize(ndim)
+    for i in range(ndim):
+        vec[i] = t[i]
+    return 0
