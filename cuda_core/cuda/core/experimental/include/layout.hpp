@@ -6,6 +6,7 @@
 #include <vector>
 #include <numeric>
 
+
 #define STRIDED_LAYOUT_MAX_NDIM 32
 #define AXIS_MASK_ALL 0xFFFFFFFF
 
@@ -15,16 +16,18 @@ inline int64_t _c_abs(int64_t x)
 }
 
 template <typename T>
-void _swap(std::vector<T> &a, std::vector<T> &b) noexcept
+void _swap(T &a, T &b) noexcept
 {
     std::swap(a, b);
 }
 
-inline void _order_from_strides(std::vector<int> &indices, const std::vector<int64_t> &shape, const std::vector<int64_t> &strides)
+inline void _order_from_strides(std::vector<int>& indices, const int64_t* shape, const int64_t* strides, int ndim)
 {
-    int ndim = shape.size();
     indices.resize(ndim);
     std::iota(indices.begin(), indices.end(), 0);
+    if (!strides) {
+        return;
+    }
     std::sort(indices.begin(), indices.end(),
               [&strides, &shape](int i, int j)
               {
