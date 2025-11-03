@@ -60,7 +60,7 @@ cdef enum Property:
 
 cdef struct BaseLayout:
     # A struct holding the shape and strides for the layout.
-    # Use ``_resize_layout`` to initialize the layout, it will
+    # Use ``_init_layout`` to initialize the layout, it will
     # set the ``shape`` and ``strides`` pointers to point to
     # ndim contigious integer arrays.
     # The ``shape`` pointer must not be NULL, the ``strides`` can be
@@ -109,7 +109,7 @@ cdef class StridedLayout:
     cdef inline int _init(StridedLayout self, BaseLayout& base, int itemsize, bint strides_in_bytes=False) except -1 nogil:
         _validate_itemsize(itemsize)
 
-        if strides_in_bytes:
+        if base.strides != NULL and strides_in_bytes:
             _divide_strides(base, itemsize)
         
         self.itemsize = itemsize
@@ -131,8 +131,6 @@ cdef class StridedLayout:
             volume = _dense_strides_in_order(base, deref(stride_order))
         else:
             raise ValueError("The stride_order must be 'C', 'F', or a permutation.")
-        if volume == 0:
-            _zeros_strides(base)
 
         self.itemsize = itemsize
         self.slice_offset = 0
@@ -236,19 +234,19 @@ cdef class StridedLayout:
     cdef inline bint get_is_contiguous_c(StridedLayout self) except -1 nogil:
         if _has_valid_property(self, PROP_IS_CONTIGUOUS_C):
             return _boolean_property(self, PROP_IS_CONTIGUOUS_C)
-        return _set_boolean_property(self, PROP_IS_CONTIGUOUS_C, _is_contiguous_c(self.base))
+        return _set_boolean_property(self, PROP_IS_CONTIGUOUS_C, _is_contiguous_c(self.get_volume(), self.base))
 
     cdef inline bint get_is_contiguous_f(StridedLayout self) except -1 nogil:
         if _has_valid_property(self, PROP_IS_CONTIGUOUS_F):
             return _boolean_property(self, PROP_IS_CONTIGUOUS_F)
-        return _set_boolean_property(self, PROP_IS_CONTIGUOUS_F, _is_contiguous_f(self.base))
+        return _set_boolean_property(self, PROP_IS_CONTIGUOUS_F, _is_contiguous_f(self.get_volume(), self.base))
 
     cdef inline bint get_is_contiguous_any(StridedLayout self) except -1 nogil:
         if _has_valid_property(self, PROP_IS_CONTIGUOUS_ANY):
             return _boolean_property(self, PROP_IS_CONTIGUOUS_ANY)
         cdef axis_order_t stride_order
         self.get_stride_order(stride_order)
-        return _set_boolean_property(self, PROP_IS_CONTIGUOUS_ANY, _is_contiguous_any(self.base, stride_order))
+        return _set_boolean_property(self, PROP_IS_CONTIGUOUS_ANY, _is_contiguous_any(self.get_volume(), self.base, stride_order))
     
     cdef inline int get_offset_bounds(StridedLayout self, stride_t& min_offset, stride_t& max_offset) except -1 nogil:
         min_offset = 0
@@ -291,32 +289,44 @@ cdef class StridedLayout:
     cdef inline int64_t get_slice_offset_in_bytes(StridedLayout self) except -1 nogil:
         return _overflow_checked_mul(self.slice_offset, self.itemsize)
     
-    #cdef axes_mask_t get_flattened_axis_mask(StridedLayout self) except? -1 nogil
-    #cdef int get_max_compatible_itemsize(StridedLayout self, int max_itemsize, intptr_t base_ptr, int axis=*) except -1 nogil
+    cdef axes_mask_t get_flattened_axis_mask(StridedLayout self) except? -1 nogil
 
     # ==============================
     # Layout manipulation
     # ==============================
 
-    #cdef int reshape_into(StridedLayout self, StridedLayout out_layout, shape_t& shape) except -1 nogil
-    #cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_order_t& axis_order) except -1 nogil
+    
+    cdef int reshape_into(StridedLayout self, StridedLayout out_layout, BaseLayout& new_shape) except -1 nogil
+    cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_order_t& axis_order) except -1 nogil
+    
     #cdef int flatten_into(StridedLayout self, StridedLayout out_layout, axes_mask_t axis_mask=*) except -1 nogil
     #cdef int squeeze_into(StridedLayout self, StridedLayout out_layout) except -1 nogil
+    #cdef int get_max_compatible_itemsize(StridedLayout self, int max_itemsize, intptr_t data_ptr, int axis=-1) except -1 nogil
     #cdef int pack_into(StridedLayout self, StridedLayout out_layout, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=*) except -1 nogil
     #cdef int unpack_into(StridedLayout self, StridedLayout out_layout, int itemsize, int axis=*) except -1 nogil
-    #cdef int slice_into(StridedLayout self, StridedLayout out_layout, tuple slices) except -1
+    cdef int slice_into(StridedLayout self, StridedLayout out_layout, tuple slices) except -1
 
 # ==============================
 # Base layout helpers
 # ==============================
 
 
-cdef inline int _resize_layout(BaseLayout& layout, int ndim) except -1 nogil:
+cdef inline int _init_layout(BaseLayout& layout, int ndim) except -1 nogil:
     if ndim > STRIDED_LAYOUT_MAX_NDIM:
         raise ValueError(f"Unsupported number of dimensions: {ndim}. Max supported ndim is {STRIDED_LAYOUT_MAX_NDIM}")
-    layout._mem.resize(2 * ndim)
+    # resize(0) is no op, that results in _mem.data() being NULL,
+    # which would make it tricky to distinguish between strides == NULL 
+    # and strides == tuple() 
+    layout._mem.resize(2 * max(ndim, 1))
     layout.shape = layout._mem.data()
     layout.strides = layout._mem.data() + ndim
+    layout.ndim = ndim
+    return 0
+
+
+cdef inline int _trim_layout(BaseLayout& layout, int ndim) except -1 nogil:
+    if ndim > layout.ndim:
+        raise AssertionError(f"Cannot trim layout to {ndim} dimensions, it has {layout.ndim} dimensions")
     layout.ndim = ndim
     return 0
 
@@ -330,7 +340,7 @@ cdef inline void _swap_layout(BaseLayout& a, BaseLayout& b) noexcept nogil:
 
 cdef inline void _assure_strides_ptr(BaseLayout& base) noexcept nogil:
     if base.strides == NULL:
-        base.strides = base._mem.data() + base.ndim
+        base.strides = base._mem.data() + base._mem.size() // 2
 
 
 cdef inline bint _base_layout_equal(BaseLayout& a, BaseLayout& b) noexcept nogil:
@@ -368,7 +378,7 @@ cdef inline int _divide_strides(BaseLayout& base, int itemsize) except -1 nogil:
     return 0
 
 
-cdef inline void _zeros_strides(BaseLayout& base) noexcept nogil:
+cdef inline void _zero_strides(BaseLayout& base) noexcept nogil:
     _assure_strides_ptr(base)
     for i in range(base.ndim):
         base.strides[i] = 0
@@ -383,6 +393,8 @@ cdef inline stride_t _dense_strides_c(BaseLayout& base) except? -1 nogil:
         base.strides[i] = stride
         stride = _overflow_checked_mul(stride, base.shape[i])
         i -= 1
+    if stride == 0:
+        _zero_strides(base)
     return stride
 
 
@@ -395,6 +407,8 @@ cdef inline stride_t _dense_strides_f(BaseLayout& base) except? -1 nogil:
         base.strides[i] = stride
         stride = _overflow_checked_mul(stride, base.shape[i])
         i += 1
+    if stride == 0:
+        _zero_strides(base)
     return stride
 
 
@@ -419,11 +433,13 @@ cdef inline stride_t _dense_strides_in_order(BaseLayout& base, axis_order_t& str
         base.strides[axis] = stride
         stride = _overflow_checked_mul(stride, base.shape[axis])
         i -= 1
+    if stride == 0:
+        _zero_strides(base)
     return stride
 
 
-cdef inline bint _is_contiguous_c(BaseLayout& base) except -1 nogil:
-    if base.strides == NULL:
+cdef inline bint _is_contiguous_c(int64_t volume, BaseLayout& base) except -1 nogil:
+    if volume == 0 or base.strides == NULL:
         return True
     cdef int64_t stride = 1
     cdef int64_t j = base.ndim - 1
@@ -438,12 +454,21 @@ cdef inline bint _is_contiguous_c(BaseLayout& base) except -1 nogil:
     return True
 
 
-cdef inline bint _is_contiguous_f(BaseLayout& base) except -1 nogil:
-    if base.strides == NULL:
-        return False
+cdef inline bint _is_contiguous_f(int64_t volume, BaseLayout& base) except -1 nogil:
+    if volume == 0:
+        return True
     cdef int ndim = base.ndim
-    cdef int64_t stride = 1
     cdef int64_t j = 0
+    if base.strides == NULL:
+        # find first non-singleton dimension
+        while j < ndim and base.shape[j] == 1:
+            j += 1
+        # if any subsequent dimension is not a singleton, return False
+        for i in range(j + 1, ndim):
+            if base.shape[i] != 1:
+                return False
+        return True
+    cdef int64_t stride = 1
     cdef extent_t extent
     while j < ndim:
         extent = base.shape[j]
@@ -455,8 +480,8 @@ cdef inline bint _is_contiguous_f(BaseLayout& base) except -1 nogil:
     return True
 
 
-cdef inline bint _is_contiguous_any(BaseLayout& base, axis_order_t& axis_order) except -1 nogil:
-    if base.strides == NULL:
+cdef inline bint _is_contiguous_any(int64_t volume, BaseLayout& base, axis_order_t& axis_order) except -1 nogil:
+    if volume == 0 or base.strides == NULL:
         return True
     cdef int64_t stride = 1
     cdef int64_t j = base.ndim - 1
@@ -475,7 +500,7 @@ cdef inline bint _is_contiguous_any(BaseLayout& base, axis_order_t& axis_order) 
 
 cdef inline int _init_base_layout_from_tuple(BaseLayout& base, tuple shape, tuple strides) except -1:
     cdef int ndim = len(shape)
-    _resize_layout(base, ndim)
+    _init_layout(base, ndim)
     cdef extent_t extent
     for i in range(ndim):
         extent = shape[i]
@@ -493,7 +518,7 @@ cdef inline int _init_base_layout_from_tuple(BaseLayout& base, tuple shape, tupl
 
 
 cdef inline int _init_base_layout_from_ptr(BaseLayout& base, int ndim, extent_t* shape, stride_t* strides) except -1 nogil:
-    _resize_layout(base, ndim)
+    _init_layout(base, ndim)
     cdef extent_t extent
     for i in range(ndim):
         extent = shape[i]
