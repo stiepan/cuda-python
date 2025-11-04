@@ -29,18 +29,22 @@ class ReshapeErr(Enum):
     AMBIGUOUS_NEG_EXTENT = "The -1 extent is ambiguous when the volume is 0"
     DIVISIBILITY_VIOLATION = "The original volume {old_volume} must be divisible by the specified sub-volume {new_volume}"
     INCOM_STRIDES = "Layout strides are incompatible with the new shape"
+    TYPE_ERROR = None
 
 
 class PermuteErr(Enum):
     INVALID_LEN = "Permutation must have the same length as the number of dimensions, got {perm_len} for {ndim}D tensor."
     OUT_OF_RANGE = "out of range for {ndim}D tensor"
     MULTIPLE_OCCURRENCES = "appears multiple times."
+    TYPE_ERROR = None
 
 
 class SliceErr(Enum):
     ZERO_STEP = "slice step cannot be zer"
     TOO_MANY_SLICES = "is greater than the number of dimensions"
     OUT_OF_RANGE = "out of range for axis"
+    TYPE_ERROR = "Expected slice instance or integer."
+
 
 _ITEMSIZES = [1, 2, 4, 8, 16]
 
@@ -97,6 +101,11 @@ class LayoutSpec:
                 f"itemsize.{self.itemsize}",
             ]
         )
+
+    def layout(self):
+        if self.stride_kind == StridesKind.IMPLICIT_C:
+            assert self.strides is None
+        return StridedLayout(self.shape, self.strides, self.itemsize)
 
 
 def gen_permutations(rng, n):
@@ -211,6 +220,10 @@ def dtype_from_itemsize(itemsize):
         return np.dtype(f"complex128")
     else:
         raise ValueError(f"Unsupported itemsize: {itemsize}")
+
+
+def flatten_mask2str(mask, ndim):
+    return "".join("1" if mask & (1 << i) else "0" for i in range(ndim))
 
 
 def gen_layouts(rng, shape, stride_kind, itemsize):
@@ -386,6 +399,7 @@ def test_permute(shape, permutation, stride_kind, itemsize):
             ((1, 2, 3), (1, 253333, 2), PermuteErr.OUT_OF_RANGE),
             ((1, 2, 3), (0, -4, 1), PermuteErr.OUT_OF_RANGE),
             ((1, 2, 3, 4), (0, 1, 0, 2), PermuteErr.MULTIPLE_OCCURRENCES),
+            ((1, 2, 3), ("abc",), PermuteErr.TYPE_ERROR),
         ]
         for stride_kind in [StridesKind.C, StridesKind.IMPLICIT_C]
     ],
@@ -402,10 +416,13 @@ def test_invalid_permute(shape, permutation, error_msg, stride_kind, itemsize):
     else:
         layout = StridedLayout.dense(shape, itemsize)
 
-    with pytest.raises(
-        ValueError,
-        match=error_msg.value.format(perm_len=len(permutation), ndim=len(shape)),
-    ):
+    if error_msg == PermuteErr.TYPE_ERROR:
+        error_cls = TypeError
+        match = None
+    else:
+        error_cls = ValueError
+        match = error_msg.value.format(perm_len=len(permutation), ndim=len(shape))
+    with pytest.raises(error_cls, match=match):
         layout.permuted(permutation)
 
 
@@ -445,6 +462,9 @@ def test_invalid_permute(shape, permutation, error_msg, stride_kind, itemsize):
             ((11, 12, 3, 5), (_SL[:, 1, :-1],), None),
             ((11, 12, 3), (_SL[0, 1, 2],), None),
             ((11, 12, 3), (_SL[0, 1, 5],), SliceErr.OUT_OF_RANGE),
+            ((11, 12, 3), (_SL[-2],), None),
+            ((11, 12, 3), (_SL[-42],), SliceErr.OUT_OF_RANGE),
+            ((11, 12, 3), ("abc",), SliceErr.TYPE_ERROR),
         ]
         for stride_kind in [StridesKind.C, StridesKind.F, StridesKind.IMPLICIT_C]
     ],
@@ -468,7 +488,8 @@ def test_slice(shape, slices, error_msg, stride_kind, itemsize):
         layout = StridedLayout.dense(shape, itemsize, stride_order=order)
 
     if error_msg:
-        with pytest.raises(ValueError, match=error_msg.value):
+        error_cls = TypeError if error_msg == SliceErr.TYPE_ERROR else ValueError
+        with pytest.raises(error_cls, match=error_msg.value):
             for sl in slices:
                 layout = layout[sl]
         return
@@ -478,16 +499,22 @@ def test_slice(shape, slices, error_msg, stride_kind, itemsize):
     )
 
     cmp_layouts(layout, np_ref, stride_kind == StridesKind.IMPLICIT_C)
-    sliced = layout
-    ref_sliced = np_ref
+    prev_layout = layout
+    prev_ref = np_ref
     for sl in slices:
-        sliced = sliced[sl]
-        ref_sliced = ref_sliced[sl]
-    cmp_layouts(sliced, ref_sliced, False)
-    # cannot access numpy's scalar data pointer
-    if sliced.ndim > 0:
-        ref_offset = ref_sliced.ctypes.data - np_ref.ctypes.data
-        assert sliced.slice_offset_in_bytes == ref_offset
+        sliced = prev_layout[sl]
+        ref_sliced = prev_ref[sl]
+        cmp_layouts(sliced, ref_sliced, False)
+        assert sliced.itemsize == itemsize
+        # cannot access numpy's scalar data pointer
+        if sliced.ndim > 0:
+            ref_offset = ref_sliced.ctypes.data - prev_ref.ctypes.data
+            layout_offset = (
+                sliced.slice_offset_in_bytes - prev_layout.slice_offset_in_bytes
+            )
+            assert layout_offset == ref_offset
+        prev_layout = sliced
+        prev_ref = ref_sliced
 
 
 @pytest.mark.parametrize(
@@ -511,6 +538,7 @@ def test_slice(shape, slices, error_msg, stride_kind, itemsize):
             Param("itemsize", py_rng.choice(_ITEMSIZES)),
         )
         for shape, slices, new_shape, permutation, error_msg in [
+            (tuple(), tuple(), tuple(), tuple(), None),
             ((12,), _SL[:], (12,), (0,), None),
             ((12,), _SL[:], (11,), (0,), ReshapeErr.VOLUME_MISMATCH),
             ((12,), _SL[1:], (11,), (0,), None),
@@ -597,6 +625,7 @@ def test_slice(shape, slices, error_msg, stride_kind, itemsize):
             ((7, 6, 5), _SL[:], (-7, 6, -5), (0, 1, 2), ReshapeErr.NEG_EXTENT),
             ((7, 6, 5), _SL[:], (5, 0, -1), (0, 1, 2), ReshapeErr.AMBIGUOUS_NEG_EXTENT),
             ((7, 0, 5), _SL[:], (5, 0, -1), (0, 1, 2), ReshapeErr.AMBIGUOUS_NEG_EXTENT),
+            ((7, 6, 5), _SL[:], map, (0, 1, 2), ReshapeErr.TYPE_ERROR),
         ]
         for base_stride_kind in [StridesKind.C, StridesKind.IMPLICIT_C]
     ],
@@ -640,10 +669,14 @@ def test_reshape(
         if error_msg == ReshapeErr.INCOM_STRIDES:
             with pytest.raises(ValueError):
                 np_ref.reshape(new_shape, copy=False)
-        vol = math.prod(np_ref.shape)
-        new_vol = math.prod(new_shape)
-        error_msg = error_msg.value.format(old_volume=vol, new_volume=abs(new_vol))
-        with pytest.raises(ValueError, match=error_msg):
+        error_cls = TypeError if error_msg == ReshapeErr.TYPE_ERROR else ValueError
+        if error_msg == ReshapeErr.TYPE_ERROR:
+            msg = None
+        else:
+            vol = math.prod(np_ref.shape)
+            new_vol = math.prod(new_shape)
+            msg = error_msg.value.format(old_volume=vol, new_volume=abs(new_vol))
+        with pytest.raises(error_cls, match=msg):
             layout.reshaped(new_shape)
     else:
         reshaped = layout.reshaped(new_shape)
@@ -651,3 +684,382 @@ def test_reshape(
         assert reshaped_np.ctypes.data == np_ref.ctypes.data
 
         cmp_layouts(reshaped, reshaped_np, False)
+        assert reshaped.itemsize == itemsize
+        assert reshaped.slice_offset == layout.slice_offset
+
+
+@pytest.mark.parametrize(
+    (
+        "shape",
+        "slices",
+        "permutation",
+        "expected_shape",
+        "expected_strides",
+        "expected_axis_mask",
+        "stride_kind",
+        "itemsize",
+    ),
+    [
+        (
+            Param("shape", shape),
+            Param("slices", slices),
+            Param("permutation", permutation),
+            Param("expected_shape", expected_shape),
+            Param("expected_strides", expected_strides),
+            Param("expected_axis_mask", expected_axis_mask),
+            Param("stride_kind", stride_kind),
+            Param("itemsize", py_rng.choice(_ITEMSIZES)),
+        )
+        for shape, slices, permutation, expected_shape, expected_strides, expected_axis_mask in [
+            ((12,), _SL[:], None, (12,), (1,), "0"),
+            ((1, 2, 3, 4, 5), _SL[:], None, (120,), (1,), "01111"),
+            ((1, 2, 3, 0, 5), _SL[:], None, (0,), (0,), "01111"),
+            ((5, 1, 2, 4, 3), _SL[:, :, :, :, ::-2], None, (40, 2), (3, -2), "01110"),
+            ((5, 2, 4, 3), _SL[:, ::-1, :, :], None, (5, 2, 12), (24, -12, 1), "0001"),
+            (
+                (5, 7, 4, 3),
+                _SL[:, ::-1, ::-1, :],
+                None,
+                (5, 28, 3),
+                (84, -3, 1),
+                "0010",
+            ),
+            ((5, 4, 3, 7), _SL[:], (2, 3, 0, 1), (21, 20), (1, 21), "0101"),
+            ((5, 4, 3, 7), _SL[:], (3, 2, 0, 1), (7, 3, 20), (1, 7, 21), "0001"),
+        ]
+        for stride_kind in [StridesKind.C, StridesKind.IMPLICIT_C]
+    ],
+    ids=idfn,
+)
+def test_flatten(
+    shape,
+    slices,
+    permutation,
+    expected_shape,
+    expected_strides,
+    expected_axis_mask,
+    stride_kind,
+    itemsize,
+):
+    shape = shape.value
+    stride_kind = stride_kind.value
+    slices = slices.value
+    permutation = permutation.value
+    expected_shape = expected_shape.value
+    expected_strides = expected_strides.value
+    expected_axis_mask = expected_axis_mask.value
+    itemsize = itemsize.value
+
+    if stride_kind == StridesKind.IMPLICIT_C:
+        layout = StridedLayout(shape, None, itemsize)
+    else:
+        assert stride_kind == StridesKind.C
+        layout = StridedLayout.dense(shape, itemsize)
+
+    if not is_id_slice(slices):
+        layout = layout[slices]
+    if permutation and not is_id_perm(permutation):
+        layout = layout.permuted(permutation)
+
+    mask = flatten_mask2str(layout.flattened_axis_mask(), layout.ndim)
+    assert mask == expected_axis_mask
+
+    flattened = layout.flattened()
+    assert flattened.shape == expected_shape
+    assert flattened.strides == expected_strides
+    assert flattened.itemsize == itemsize
+    assert flattened.slice_offset == layout.slice_offset
+
+    # cannot be flattened any further
+    assert flattened.flattened_axis_mask() == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "layout_spec_0",
+        "layout_spec_1",
+        "expected_layout_spec_0",
+        "expected_layout_spec_1",
+    ),
+    [
+        (
+            layout_spec_0,
+            layout_spec_1,
+            expected_layout_spec_0,
+            expected_layout_spec_1,
+        )
+        for layout_spec_0, layout_spec_1, expected_layout_spec_0, expected_layout_spec_1 in [
+            (
+                LayoutSpec(tuple(), StridesKind.C, tuple(), 2),
+                LayoutSpec(tuple(), StridesKind.C, tuple(), 4),
+                LayoutSpec(tuple(), StridesKind.C, tuple(), 2),
+                LayoutSpec(tuple(), StridesKind.C, tuple(), 4),
+            ),
+            (
+                LayoutSpec((255,), StridesKind.IMPLICIT_C, None, 1),
+                LayoutSpec((70,), StridesKind.IMPLICIT_C, None, 1),
+                LayoutSpec((255,), StridesKind.C, (1,), 1),
+                LayoutSpec((70,), StridesKind.C, (1,), 1),
+            ),
+            (
+                LayoutSpec((2, 7, 13, 5), StridesKind.IMPLICIT_C, None, 8),
+                LayoutSpec((3, 5, 11, 1), StridesKind.IMPLICIT_C, None, 4),
+                LayoutSpec((910,), StridesKind.C, (1,), 8),
+                LayoutSpec((165,), StridesKind.C, (1,), 4),
+            ),
+            (
+                LayoutSpec((2, 7, 13, 5), StridesKind.C, (455, 65, 5, 1), 8),
+                LayoutSpec((3, 5, 11, 1), StridesKind.IMPLICIT_C, None, 4),
+                LayoutSpec((910,), StridesKind.C, (1,), 8),
+                LayoutSpec((165,), StridesKind.C, (1,), 4),
+            ),
+            (
+                LayoutSpec((2, 7, 13, 5), StridesKind.C, (455, 65, 5, 1), 8),
+                LayoutSpec((3, 5, 11, 1), StridesKind.C, (55, 11, 1, 1), 4),
+                LayoutSpec((910,), StridesKind.C, (1,), 8),
+                LayoutSpec((165,), StridesKind.C, (1,), 4),
+            ),
+            (
+                LayoutSpec((5, 7, 13, 2), StridesKind.PERMUTED, (1, 65, 5, 455), 8),
+                LayoutSpec((3, 5, 11, 1), StridesKind.IMPLICIT_C, None, 4),
+                LayoutSpec((5, 91, 2), StridesKind.PERMUTED, (1, 5, 455), 8),
+                LayoutSpec((3, 55, 1), StridesKind.C, (55, 1, 1), 4),
+            ),
+            (
+                LayoutSpec((2, 7, 13, 5), StridesKind.C, (455, 65, 5, 1), 8),
+                LayoutSpec((11, 1, 3, 5), StridesKind.PERMUTED, (1, 1, 55, 11), 4),
+                LayoutSpec((14, 65), StridesKind.C, (65, 1), 8),
+                LayoutSpec((11, 15), StridesKind.PERMUTED, (1, 11), 4),
+            ),
+            (
+                LayoutSpec(
+                    (4, 5, 11, 2, 3, 7),
+                    StridesKind.PERMUTED,
+                    (55, 11, 1, 660, 220, 1320),
+                    8,
+                ),
+                LayoutSpec(
+                    (3, 8, 5, 6, 7, 9),
+                    StridesKind.PERMUTED,
+                    (72, 9, 3024, 504, 72, 1),
+                    4,
+                ),
+                LayoutSpec((20, 11, 6, 7), StridesKind.PERMUTED, (11, 1, 220, 1320), 8),
+                LayoutSpec((24, 5, 42, 9), StridesKind.PERMUTED, (9, 3024, 72, 1), 4),
+            ),
+        ]
+    ],
+    ids=idfn,
+)
+def test_flatten_together(
+    layout_spec_0,
+    layout_spec_1,
+    expected_layout_spec_0,
+    expected_layout_spec_1,
+):
+    layout_0 = layout_spec_0.layout()
+    layout_1 = layout_spec_1.layout()
+
+    mask_0 = layout_0.flattened_axis_mask()
+    mask_1 = layout_1.flattened_axis_mask()
+    mask = mask_0 & mask_1
+
+    flattened_0 = layout_0.flattened(mask=mask)
+    flattened_1 = layout_1.flattened(mask=mask)
+    expected_layout_0 = expected_layout_spec_0.layout()
+    expected_layout_1 = expected_layout_spec_1.layout()
+    assert flattened_0 == expected_layout_0
+    assert flattened_0.shape == expected_layout_0.shape
+    assert flattened_0.strides == expected_layout_0.strides
+    assert flattened_0.itemsize == expected_layout_0.itemsize
+    assert flattened_1 == expected_layout_1
+    assert flattened_1.shape == expected_layout_1.shape
+    assert flattened_1.strides == expected_layout_1.strides
+    assert flattened_1.itemsize == expected_layout_1.itemsize
+
+    for flat_layout, flat_spec in zip(
+        [flattened_0, flattened_1], [expected_layout_spec_0, expected_layout_spec_1]
+    ):
+        should_be_c_contig = flat_spec.stride_kind in [
+            StridesKind.C,
+            StridesKind.IMPLICIT_C,
+        ]
+        assert flat_layout.is_contiguous_c == should_be_c_contig
+
+
+@pytest.mark.parametrize(
+    (
+        "shape",
+        "slices",
+        "permutation",
+        "stride_kind",
+        "itemsize",
+    ),
+    [
+        (
+            Param("shape", shape),
+            Param("slices", slices),
+            Param("permutation", permutation),
+            Param("stride_kind", stride_kind),
+            Param("itemsize", py_rng.choice(_ITEMSIZES)),
+        )
+        for shape, slices, permutation in [
+            (tuple(), tuple(), tuple()),
+            ((12,), _SL[:], None),
+            ((1, 5, 4, 3), _SL[:], None),
+            ((1, 5, 4, 3), _SL[:, -1:, :], None),
+            ((1, 5, 4, 3), _SL[:, -1:, :1, 1:2], None),
+            ((7, 5, 3), _SL[::-1, 3:2:-1, :], (2, 0, 1)),
+            ((7, 5, 3), _SL[:, 3:2, :], (2, 0, 1)),
+        ]
+        for stride_kind in [StridesKind.C, StridesKind.IMPLICIT_C, StridesKind.F]
+    ],
+    ids=idfn,
+)
+def test_squeezed(shape, slices, permutation, stride_kind, itemsize):
+    shape = shape.value
+    slices = slices.value
+    permutation = permutation.value
+    stride_kind = stride_kind.value
+    itemsize = itemsize.value
+
+    if stride_kind == StridesKind.IMPLICIT_C:
+        layout = StridedLayout(shape, None, itemsize)
+        order = "C"
+    elif stride_kind == StridesKind.C:
+        layout = StridedLayout.dense(shape, itemsize, stride_order="C")
+        order = "C"
+    elif stride_kind == StridesKind.F:
+        layout = StridedLayout.dense(shape, itemsize, stride_order="F")
+        order = "F"
+    else:
+        raise ValueError(f"Invalid stride kind: {stride_kind}")
+
+    np_ref = np.arange(math.prod(shape), dtype=dtype_from_itemsize(itemsize)).reshape(
+        shape, order=order
+    )
+    has_id_perm = permutation is None or is_id_perm(permutation)
+    has_id_slice = is_id_slice(slices)
+
+    if not has_id_slice:
+        layout = layout[slices]
+        np_ref = np_ref[slices]
+    if not has_id_perm:
+        layout = layout.permuted(permutation)
+        np_ref = np_ref.transpose(permutation)
+
+    has_no_strides = (
+        stride_kind == StridesKind.IMPLICIT_C and has_id_perm and has_id_slice
+    )
+    cmp_layouts(layout, np_ref, has_no_strides)
+
+    squeezed = layout.squeezed()
+    squeezed_ref = np_ref.squeeze()
+    if math.prod(np_ref.shape) != 0:
+        cmp_layouts(squeezed, squeezed_ref, False)
+    else:
+        assert squeezed.shape == (0,)
+        assert squeezed.strides == (0,)
+    assert squeezed.slice_offset == layout.slice_offset
+
+
+@pytest.mark.parametrize(
+    (
+        "shape",
+        "slices",
+        "permutation",
+        "stride_kind",
+        "itemsize",
+        "expected_max_itemsize",
+        "new_itemsize",
+    ),
+    [
+        (
+            Param("shape", shape),
+            Param("slices", slices),
+            Param("permutation", permutation),
+            Param("stride_kind", stride_kind),
+            Param("itemsize", itemsize),
+            Param("expected_max_itemsize", expected_max_itemsize),
+            Param("new_itemsize", new_itemsize),
+        )
+        for shape, slices, permutation, stride_kind, itemsize, expected_max_itemsize, new_itemsize in [
+            ((12,), _SL[:], None, StridesKind.C, 1, 4, 1),
+            ((12,), _SL[:], None, StridesKind.IMPLICIT_C, 1, 4, 1),
+            ((12,), _SL[:], None, StridesKind.F, 1, 4, 1),
+            ((12,), _SL[:], None, StridesKind.C, 4, 16, 8),
+            ((12,), _SL[:], None, StridesKind.IMPLICIT_C, 4, 16, 8),
+            ((12,), _SL[:], None, StridesKind.F, 4, 16, 8),
+            ((16, 5, 4, 6), _SL[:], None, StridesKind.C, 2, 4, 4),
+            ((16, 5, 4, 6), _SL[:], None, StridesKind.IMPLICIT_C, 2, 4, 4),
+            ((16, 5, 4, 6), _SL[:], None, StridesKind.F, 2, 16, 4),
+            ((11, 5, 9), _SL[:, :, -1:], None, StridesKind.C, 2, 2, 2),
+            ((11, 5, 9), _SL[:, :, -1:], None, StridesKind.IMPLICIT_C, 2, 2, 2),
+            ((11, 5, 9), _SL[:, :, -1:], None, StridesKind.F, 2, 2, 2),
+            ((12, 3, 24), _SL[1:, ::-1, 20:], (1, 2, 0), StridesKind.C, 2, 8, 8),
+            ((12, 3, 24), _SL[10:, 1:, ::-1], (1, 2, 0), StridesKind.F, 2, 4, 4),
+        ]
+    ],
+    ids=idfn,
+)
+def test_packed_unpacked(
+    shape,
+    slices,
+    permutation,
+    stride_kind,
+    itemsize,
+    expected_max_itemsize,
+    new_itemsize,
+):
+    shape = shape.value
+    slices = slices.value
+    permutation = permutation.value
+    stride_kind = stride_kind.value
+    itemsize = itemsize.value
+    expected_max_itemsize = expected_max_itemsize.value
+    new_itemsize = new_itemsize.value
+
+    if stride_kind == StridesKind.IMPLICIT_C:
+        layout = StridedLayout(shape, None, itemsize)
+        order = "C"
+    elif stride_kind == StridesKind.C:
+        layout = StridedLayout.dense(shape, itemsize, stride_order="C")
+        order = "C"
+    elif stride_kind == StridesKind.F:
+        layout = StridedLayout.dense(shape, itemsize, stride_order="F")
+        order = "F"
+    else:
+        raise ValueError(f"Invalid stride kind: {stride_kind}")
+
+    np_ref = np.arange(math.prod(shape), dtype=dtype_from_itemsize(itemsize)).reshape(
+        shape, order=order
+    )
+    has_id_perm = permutation is None or is_id_perm(permutation)
+    has_id_slice = is_id_slice(slices)
+
+    if not has_id_slice:
+        layout = layout[slices]
+        np_ref = np_ref[slices]
+    if not has_id_perm:
+        layout = layout.permuted(permutation)
+        np_ref = np_ref.transpose(permutation)
+
+    has_no_strides = (
+        stride_kind == StridesKind.IMPLICIT_C and has_id_perm and has_id_slice
+    )
+    cmp_layouts(layout, np_ref, has_no_strides)
+
+    axis = layout.stride_order[-1]
+    assert layout.max_compatible_itemsize(axis=axis) == expected_max_itemsize
+    packed = layout.packed(new_itemsize, axis=axis)
+    packed_ref = (
+        np_ref.transpose(layout.stride_order)
+        .view(dtype=dtype_from_itemsize(new_itemsize))
+        .transpose(inv_permutation(layout.stride_order))
+    )
+    cmp_layouts(packed, packed_ref, has_no_strides and itemsize == new_itemsize)
+    vec_size = new_itemsize // itemsize
+    assert packed.slice_offset * vec_size == layout.slice_offset
+    unpacked = packed.unpacked(itemsize, axis=axis)
+    cmp_layouts(unpacked, np_ref, has_no_strides and itemsize == new_itemsize)
+    assert unpacked.slice_offset == layout.slice_offset

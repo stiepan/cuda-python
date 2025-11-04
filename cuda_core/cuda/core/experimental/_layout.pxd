@@ -290,6 +290,7 @@ cdef class StridedLayout:
         return _overflow_checked_mul(self.slice_offset, self.itemsize)
     
     cdef axes_mask_t get_flattened_axis_mask(StridedLayout self) except? -1 nogil
+    cdef int get_max_compatible_itemsize(StridedLayout self, int max_itemsize, intptr_t data_ptr, int axis=*) except -1 nogil
 
     # ==============================
     # Layout manipulation
@@ -299,11 +300,10 @@ cdef class StridedLayout:
     cdef int reshape_into(StridedLayout self, StridedLayout out_layout, BaseLayout& new_shape) except -1 nogil
     cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_order_t& axis_order) except -1 nogil
     
-    #cdef int flatten_into(StridedLayout self, StridedLayout out_layout, axes_mask_t axis_mask=*) except -1 nogil
-    #cdef int squeeze_into(StridedLayout self, StridedLayout out_layout) except -1 nogil
-    #cdef int get_max_compatible_itemsize(StridedLayout self, int max_itemsize, intptr_t data_ptr, int axis=-1) except -1 nogil
-    #cdef int pack_into(StridedLayout self, StridedLayout out_layout, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=*) except -1 nogil
-    #cdef int unpack_into(StridedLayout self, StridedLayout out_layout, int itemsize, int axis=*) except -1 nogil
+    cdef int flatten_into(StridedLayout self, StridedLayout out_layout, axes_mask_t axis_mask=*) except -1 nogil
+    cdef int squeeze_into(StridedLayout self, StridedLayout out_layout) except -1 nogil
+    cdef int pack_into(StridedLayout self, StridedLayout out_layout, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=*) except -1 nogil
+    cdef int unpack_into(StridedLayout self, StridedLayout out_layout, int itemsize, int axis=*) except -1 nogil
     cdef int slice_into(StridedLayout self, StridedLayout out_layout, tuple slices) except -1
 
 # ==============================
@@ -343,6 +343,14 @@ cdef inline void _assure_strides_ptr(BaseLayout& base) noexcept nogil:
         base.strides = base._mem.data() + base._mem.size() // 2
 
 
+cdef inline stride_t *get_strides_ptr(BaseLayout& base) except? NULL nogil:
+    if base.strides != NULL:
+        return base.strides
+    cdef stride_t* tmp_strides = base._mem.data() + base._mem.size() // 2
+    _dense_strides_c_ptrs(base.ndim, base.shape, tmp_strides)
+    return tmp_strides
+
+
 cdef inline bint _base_layout_equal(BaseLayout& a, BaseLayout& b) noexcept nogil:
     if a.ndim != b.ndim:
         return False
@@ -378,24 +386,32 @@ cdef inline int _divide_strides(BaseLayout& base, int itemsize) except -1 nogil:
     return 0
 
 
+cdef inline void _zero_strides_ptr(int ndim, stride_t* strides) noexcept nogil:
+    for i in range(ndim):
+        strides[i] = 0
+
+
 cdef inline void _zero_strides(BaseLayout& base) noexcept nogil:
     _assure_strides_ptr(base)
-    for i in range(base.ndim):
-        base.strides[i] = 0
+    _zero_strides_ptr(base.ndim, base.strides)
+
+
+cdef inline stride_t _dense_strides_c_ptrs(int ndim, extent_t* shape, stride_t* strides) except? -1 nogil:
+    cdef stride_t stride = 1
+    cdef int i = ndim - 1
+    while i >= 0:
+        strides[i] = stride
+        stride = _overflow_checked_mul(stride, shape[i])
+        i -= 1
+    if stride == 0:
+        _zero_strides_ptr(ndim, strides)
+    return stride
 
 
 cdef inline stride_t _dense_strides_c(BaseLayout& base) except? -1 nogil:
     cdef int ndim = base.ndim
     _assure_strides_ptr(base)
-    cdef stride_t stride = 1
-    cdef int i = ndim - 1
-    while i >= 0:
-        base.strides[i] = stride
-        stride = _overflow_checked_mul(stride, base.shape[i])
-        i -= 1
-    if stride == 0:
-        _zero_strides(base)
-    return stride
+    return _dense_strides_c_ptrs(ndim, base.shape, base.strides)
 
 
 cdef inline stride_t _dense_strides_f(BaseLayout& base) except? -1 nogil:
