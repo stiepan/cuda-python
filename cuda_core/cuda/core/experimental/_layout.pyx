@@ -20,11 +20,34 @@ cdef class StridedLayout:
 
     def __init__(StridedLayout self, object shape, object strides, int itemsize, bint strides_in_bytes=False):
         self.init_from_tuple(shape, strides, itemsize, strides_in_bytes)
-    
+
     @classmethod
     def dense(cls, object shape, int itemsize, object stride_order='C'):
         cdef StridedLayout new_layout = StridedLayout.__new__(cls)
         new_layout.init_dense_from_tuple(shape, itemsize, stride_order)
+        return new_layout
+
+    @classmethod
+    def dense_like(cls, StridedLayout other, object stride_order="K"):
+        cdef StridedLayout new_layout = StridedLayout.__new__(cls)
+        cdef OrderFlag order_flag
+        cdef axis_vec_t stride_order_vec
+
+        if stride_order == "K":
+            other.get_stride_order(stride_order_vec)
+            order_flag = ORDER_PERM
+        else:
+            order_flag = _stride_order2vec(stride_order_vec, stride_order)
+            if order_flag == ORDER_NONE:
+                raise ValueError(f"The stride_order must be 'K', 'C', 'F', or a permutation tuple. Got: {stride_order}")
+
+        new_layout.init_dense_from_ptr(
+            other.base.ndim,
+            other.base.shape,
+            other.itemsize,
+            order_flag,
+            &stride_order_vec
+        )
         return new_layout
 
     def __repr__(StridedLayout self):
@@ -98,23 +121,23 @@ cdef class StridedLayout:
     def flattened_axis_mask(StridedLayout self):
         return self.get_flattened_axis_mask()
     
-    def reshaped(self, object shape):
+    def reshaped(StridedLayout self, object shape):
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         cdef BaseLayout new_shape
-        _init_layout(new_shape, len(shape))
+        init_base_layout(new_shape, len(shape))
         for i in range(len(shape)):
             new_shape.shape[i] = shape[i]
         self.reshape_into(new_layout, new_shape)
         return new_layout
 
-    def permuted(self, object axis_order):
+    def permuted(StridedLayout self, object axis_order):
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         cdef axis_vec_t axis_order_vec
         _tuple2axis_vec(axis_order_vec, axis_order)
         self.permute_into(new_layout, axis_order_vec)
         return new_layout
 
-    def flattened(self, start_axis=0, end_axis=-1, mask=None):
+    def flattened(StridedLayout self, start_axis=0, end_axis=-1, mask=None):
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         cdef axes_mask_t axis_mask
         if mask is None:
@@ -124,15 +147,15 @@ cdef class StridedLayout:
         self.flatten_into(new_layout, axis_mask)
         return new_layout
 
-    def flattened_axis_mask(self):
+    def flattened_axis_mask(StridedLayout self):
         return self.get_flattened_axis_mask()
 
-    def squeezed(self):
+    def squeezed(StridedLayout self):
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         self.squeeze_into(new_layout)
         return new_layout
 
-    def unsqueezed(self, object axis):
+    def unsqueezed(StridedLayout self, object axis):
         cdef axis_vec_t axis_vec
         if isinstance(axis, int):
             axis_vec.push_back(axis)
@@ -144,34 +167,34 @@ cdef class StridedLayout:
         self.unsqueeze_into(new_layout, axis_vec)
         return new_layout
 
-    def broadcast_to(self, object shape):
+    def broadcast_to(StridedLayout self, object shape):
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         cdef BaseLayout new_shape
         cdef int new_ndim = len(shape)
-        _init_layout(new_shape, new_ndim)
+        init_base_layout(new_shape, new_ndim)
         for i in range(new_ndim):
             new_shape.shape[i] = shape[i]
         self.broadcast_into(new_layout, new_shape)
         return new_layout
 
-    def packed(self, int itemsize, intptr_t data_ptr=0, int axis=-1, bint keep_dim=True):
+    def packed(StridedLayout self, int itemsize, intptr_t data_ptr=0, int axis=-1, bint keep_dim=True):
         if itemsize == self.itemsize:
             return self
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         self.pack_into(new_layout, itemsize, data_ptr, keep_dim, axis)
         return new_layout
 
-    def unpacked(self, int itemsize, int axis=-1):
+    def unpacked(StridedLayout self, int itemsize, int axis=-1):
         if itemsize == self.itemsize:
             return self
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         self.unpack_into(new_layout, itemsize, axis)
         return new_layout
 
-    def max_compatible_itemsize(self, int max_itemsize=16, intptr_t data_ptr=0, int axis=-1):
+    def max_compatible_itemsize(StridedLayout self, int max_itemsize=16, intptr_t data_ptr=0, int axis=-1):
         return self.get_max_compatible_itemsize(max_itemsize, data_ptr, axis)
 
-    def sliced(self, object slices):
+    def sliced(StridedLayout self, object slices):
         if not isinstance(slices, tuple):
             slices = (slices,)
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
@@ -420,7 +443,7 @@ cdef inline axes_mask_t axis_mask_from_range(int ndim, int start_axis, int end_a
 
 cdef inline int flatten_strides_in_c_index_order(BaseLayout& out_layout, BaseLayout& in_layout, axes_mask_t axis_mask) except -1 nogil:
     cdef int ndim = in_layout.ndim
-    _init_layout(out_layout, ndim)
+    init_base_layout(out_layout, ndim)
     cdef int group_start = 0
     cdef int group_end = 0
     cdef int64_t group_vol
@@ -445,7 +468,7 @@ cdef inline int flatten_strides_in_c_index_order(BaseLayout& out_layout, BaseLay
         out_i += 1
         group_start = group_end
     if out_i != ndim:
-        _trim_layout(out_layout, out_i)
+        trim_base_layout(out_layout, out_i)
     return out_i
 
 
@@ -502,7 +525,7 @@ cdef inline bint split_strides_in_c_index_order(BaseLayout& out_layout, BaseLayo
 
 cdef inline int permute_extents(BaseLayout& out_layout, BaseLayout& in_layout, axis_vec_t& axis_order) except -1 nogil:
     cdef int ndim = in_layout.ndim
-    _init_layout(out_layout, ndim)
+    init_base_layout(out_layout, ndim)
     cdef axis_t axis
     cdef axes_mask_t axis_mask
     cdef axes_mask_t axis_order_mask = 0
@@ -527,7 +550,7 @@ cdef inline stride_t slice_extents(BaseLayout& out_layout, BaseLayout& in_layout
     cdef int num_slices = len(slices)
     if num_slices > ndim:
         raise ValueError(f"The number of slices ({num_slices}) is greater than the number of dimensions ({ndim}).")
-    _init_layout(out_layout, ndim)
+    init_base_layout(out_layout, ndim)
     cdef extent_t* in_shape = in_layout.shape
     cdef stride_t* in_strides = get_strides_ptr(in_layout)
     cdef stride_t slice_offset = 0
@@ -565,7 +588,7 @@ cdef inline stride_t slice_extents(BaseLayout& out_layout, BaseLayout& in_layout
         out_layout.strides[out_i] = in_strides[i]
         out_i += 1
     if out_i != ndim:
-        _trim_layout(out_layout, out_i)
+        trim_base_layout(out_layout, out_i)
     if zero_slice:
         _zero_strides(out_layout)
     return slice_offset
@@ -573,7 +596,7 @@ cdef inline stride_t slice_extents(BaseLayout& out_layout, BaseLayout& in_layout
 
 cdef inline int squeeze_extents(BaseLayout& out_layout, BaseLayout& in_layout) except -1 nogil:
     cdef int ndim = in_layout.ndim
-    _init_layout(out_layout, ndim)
+    init_base_layout(out_layout, ndim)
     cdef extent_t* in_shape = in_layout.shape
     cdef stride_t* in_strides = get_strides_ptr(in_layout)
     cdef int out_i = 0
@@ -581,7 +604,7 @@ cdef inline int squeeze_extents(BaseLayout& out_layout, BaseLayout& in_layout) e
     for i in range(ndim):
         extent = in_shape[i]
         if extent == 0:
-            _trim_layout(out_layout, 1)
+            trim_base_layout(out_layout, 1)
             out_layout.shape[0] = 0
             out_layout.strides[0] = 0
             return 1
@@ -590,7 +613,7 @@ cdef inline int squeeze_extents(BaseLayout& out_layout, BaseLayout& in_layout) e
             out_layout.strides[out_i] = in_strides[i]
             out_i += 1
     if out_i != ndim:
-        _trim_layout(out_layout, out_i)
+        trim_base_layout(out_layout, out_i)
     return out_i
 
 
@@ -598,8 +621,8 @@ cdef inline int unsqueeze_extents(BaseLayout& out_layout, BaseLayout& in_layout,
     cdef int ndim = in_layout.ndim
     cdef int num_new_axes = axis_vec.size()
     cdef int out_ndim = ndim + num_new_axes
-    # _init_layout checks if ndim + num_new_axes is within bounds
-    _init_layout(out_layout, out_ndim)
+    # init_base_layout validates out_ndim
+    init_base_layout(out_layout, out_ndim)
     cdef extent_t* in_shape = in_layout.shape
     cdef stride_t* in_strides = get_strides_ptr(in_layout)
     cdef axes_mask_t out_shape_mask = 0
@@ -620,16 +643,20 @@ cdef inline int unsqueeze_extents(BaseLayout& out_layout, BaseLayout& in_layout,
         axis_mask = 1 << <int>i
         if out_shape_mask & axis_mask:
             out_layout.shape[i] = 1
-            if in_i > 0:
-                out_layout.strides[i] = in_strides[in_i - 1]
+            if in_i < ndim:
+                out_layout.strides[i] = _overflow_checked_mul(in_shape[in_i], in_strides[in_i])
             else:
-                out_layout.strides[i] = _overflow_checked_mul(in_shape[0], in_strides[0])
+                if ndim > 0:
+                    out_layout.strides[i] = in_strides[ndim - 1]
+                else:
+                    out_layout.strides[i] = 1
         else:
             out_layout.shape[i] = in_shape[in_i]
             out_layout.strides[i] = in_strides[in_i]
             in_i += 1
     assert in_i == ndim
     return 0
+
 
 cdef inline int broadcast_extents(BaseLayout& broadcast, BaseLayout& in_layout) except -1 nogil:
     if broadcast.ndim < in_layout.ndim:
@@ -696,7 +723,7 @@ cdef inline int pack_extents(BaseLayout& out_layout, stride_t& out_slice_offset,
         raise ValueError(f"The slice offset ({slice_offset}) must be divisible by {vec_size}.")
     out_slice_offset = new_slice_offset
 
-    _init_layout(out_layout, ndim)
+    init_base_layout(out_layout, ndim)
     cdef stride_t packed_stride
     cdef int out_i = 0
     for i in range(ndim):
@@ -713,7 +740,7 @@ cdef inline int pack_extents(BaseLayout& out_layout, stride_t& out_slice_offset,
             out_layout.strides[out_i] = packed_stride
             out_i += 1
     if out_i != ndim:
-        _trim_layout(out_layout, out_i)
+        trim_base_layout(out_layout, out_i)
     return vec_size
 
 
@@ -738,7 +765,7 @@ cdef inline int unpack_extents(BaseLayout &out_layout, BaseLayout &in_layout, in
         raise ValueError(f"The axis {axis} stride must be 1, got {strides[axis]}.")
     
     cdef int vec_size = itemsize // new_itemsize
-    _init_layout(out_layout, ndim)
+    init_base_layout(out_layout, ndim)
     out_layout.shape[axis] = _overflow_checked_mul(shape[axis], vec_size)
     out_layout.strides[axis] = 1
 

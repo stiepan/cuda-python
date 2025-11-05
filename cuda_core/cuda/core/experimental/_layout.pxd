@@ -60,7 +60,7 @@ cdef enum Property:
 
 cdef struct BaseLayout:
     # A struct holding the shape and strides for the layout.
-    # Use ``_init_layout`` to initialize the layout, it will
+    # Use ``init_base_layout`` to initialize the layout, it will
     # set the ``shape`` and ``strides`` pointers to point to
     # ndim contigious integer arrays.
     # The ``shape`` pointer must not be NULL, the ``strides`` can be
@@ -313,7 +313,7 @@ cdef class StridedLayout:
 # ==============================
 
 
-cdef inline int _init_layout(BaseLayout& layout, int ndim) except -1 nogil:
+cdef inline int init_base_layout(BaseLayout& layout, int ndim) except -1 nogil:
     if ndim > STRIDED_LAYOUT_MAX_NDIM:
         raise ValueError(f"Unsupported number of dimensions: {ndim}. Max supported ndim is {STRIDED_LAYOUT_MAX_NDIM}")
     # resize(0) is no op, that results in _mem.data() being NULL,
@@ -326,7 +326,7 @@ cdef inline int _init_layout(BaseLayout& layout, int ndim) except -1 nogil:
     return 0
 
 
-cdef inline int _trim_layout(BaseLayout& layout, int ndim) except -1 nogil:
+cdef inline int trim_base_layout(BaseLayout& layout, int ndim) except -1 nogil:
     if ndim > layout.ndim:
         raise AssertionError(f"Cannot trim layout to {ndim} dimensions, it has {layout.ndim} dimensions")
     layout.ndim = ndim
@@ -525,7 +525,7 @@ cdef inline int _validate_shape(BaseLayout& base) except -1 nogil:
 
 cdef inline int _init_base_layout_from_tuple(BaseLayout& base, tuple shape, tuple strides) except -1:
     cdef int ndim = len(shape)
-    _init_layout(base, ndim)
+    init_base_layout(base, ndim)
     for i in range(ndim):
         base.shape[i] = shape[i]
     _validate_shape(base)
@@ -541,7 +541,7 @@ cdef inline int _init_base_layout_from_tuple(BaseLayout& base, tuple shape, tupl
 
 
 cdef inline int _init_base_layout_from_ptr(BaseLayout& base, int ndim, extent_t* shape, stride_t* strides) except -1 nogil:
-    _init_layout(base, ndim)
+    init_base_layout(base, ndim)
     for i in range(ndim):
         base.shape[i] = shape[i]
     _validate_shape(base)

@@ -156,7 +156,19 @@ def cmp_layouts(layout, arr, has_no_strides):
         assert layout.strides_in_bytes == tuple(0 for _ in range(ndim))
     else:
         assert layout.strides_in_bytes == arr.strides
+    assert layout.volume == math.prod(arr.shape)
     assert layout.itemsize == arr.itemsize
+
+    ref_c_contig = arr.flags["C_CONTIGUOUS"]
+    ref_f_contig = arr.flags["F_CONTIGUOUS"]
+    assert layout.is_contiguous_c == ref_c_contig
+    assert layout.is_contiguous_f == ref_f_contig
+    ref_any_contig = (
+        ref_c_contig
+        or ref_f_contig
+        or arr.transpose(layout.stride_order).flags["C_CONTIGUOUS"]
+    )
+    assert layout.is_contiguous_any == ref_any_contig
 
 
 def random_non_empty_slice(rng, a):
@@ -1063,3 +1075,143 @@ def test_packed_unpacked(
     unpacked = packed.unpacked(itemsize, axis=axis)
     cmp_layouts(unpacked, np_ref, has_no_strides and itemsize == new_itemsize)
     assert unpacked.slice_offset == layout.slice_offset
+
+
+@pytest.mark.parametrize(
+    (
+        "shape",
+        "slices",
+        "stride_kind",
+        "itemsize",
+        "axes",
+    ),
+    [
+        (
+            Param("shape", shape),
+            Param("slices", slices),
+            Param("stride_kind", stride_kind),
+            Param("itemsize", py_rng.choice(_ITEMSIZES)),
+            Param("axes", axes),
+        )
+        for shape, slices in [
+            (tuple(), _SL[:]),
+            ((7,), _SL[:]),
+            ((4, 5, 7, 11), _SL[1:-1, ::-1, 2:-1, ::3]),
+        ]
+        for stride_kind in [StridesKind.C, StridesKind.IMPLICIT_C, StridesKind.F]
+        for num_axes in range(3)
+        for axes in itertools.combinations(list(range(len(shape) + num_axes)), num_axes)
+    ],
+    ids=idfn,
+)
+def test_unsqueezed_layout(
+    shape,
+    slices,
+    stride_kind,
+    itemsize,
+    axes,
+):
+    shape = shape.value
+    slices = slices.value
+    stride_kind = stride_kind.value
+    itemsize = itemsize.value
+    axes = tuple(axes.value)
+
+    order = (
+        "C"
+        if stride_kind in [StridesKind.C, StridesKind.IMPLICIT_C]
+        else "F" if stride_kind == StridesKind.F else None
+    )
+
+    if stride_kind == StridesKind.IMPLICIT_C:
+        layout = StridedLayout(shape, None, itemsize)
+    else:
+        layout = StridedLayout.dense(shape, itemsize, stride_order=order)
+
+    np_ref = np.arange(math.prod(shape), dtype=dtype_from_itemsize(itemsize)).reshape(
+        shape, order=order
+    )
+    has_id_slice = is_id_slice(slices)
+    if not is_id_slice(slices):
+        layout = layout[slices]
+        np_ref = np_ref[slices]
+
+    has_no_strides = stride_kind == StridesKind.IMPLICIT_C and has_id_slice
+    cmp_layouts(layout, np_ref, has_no_strides)
+    layout = layout.unsqueezed(axes)
+    np_ref = np.expand_dims(np_ref, axis=axes)
+    cmp_layouts(layout, np_ref, has_no_strides and len(axes) == 0)
+
+
+@pytest.mark.parametrize(
+    (
+        "shape",
+        "slices",
+        "new_shape",
+        "stride_kind",
+        "itemsize",
+    ),
+    [
+        (
+            Param("shape", shape),
+            Param("slices", slices),
+            Param("new_shape", new_shape),
+            Param("stride_kind", stride_kind),
+            Param("itemsize", py_rng.choice(_ITEMSIZES)),
+        )
+        for shape, slices, new_shape in [
+            (tuple(), _SL[:], tuple()),
+            (tuple(), _SL[:], (1,)),
+            (tuple(), _SL[:], (17, 1, 5)),
+            ((1,), _SL[:], (5,)),
+            ((1,), _SL[:], (3, 5, 2)),
+            ((7,), _SL[:], (7,)),
+            ((7,), _SL[:], (2, 7)),
+            ((5, 11), _SL[1:-1, ::-1], (3, 11)),
+            ((5, 11), _SL[1:-1, ::-1], (7, 3, 11)),
+            ((5, 11), _SL[::-1, 3:4], (5, 7)),
+            ((5, 11), _SL[::-1, 3:4], (5, 30)),
+            ((5, 11), _SL[::-1, 3:4], (4, 5, 12)),
+            ((5, 11), _SL[-1:,], (4, 13, 11)),
+        ]
+        for stride_kind in [StridesKind.C, StridesKind.IMPLICIT_C, StridesKind.F]
+    ],
+    ids=idfn,
+)
+def test_broadcast_layout(
+    shape,
+    slices,
+    new_shape,
+    stride_kind,
+    itemsize,
+):
+    shape = shape.value
+    slices = slices.value
+    new_shape = new_shape.value
+    stride_kind = stride_kind.value
+    itemsize = itemsize.value
+
+    order = (
+        "C"
+        if stride_kind in [StridesKind.C, StridesKind.IMPLICIT_C]
+        else "F" if stride_kind == StridesKind.F else None
+    )
+
+    if stride_kind == StridesKind.IMPLICIT_C:
+        layout = StridedLayout(shape, None, itemsize)
+    else:
+        layout = StridedLayout.dense(shape, itemsize, stride_order=order)
+
+    np_ref = np.arange(math.prod(shape), dtype=dtype_from_itemsize(itemsize)).reshape(
+        shape, order=order
+    )
+    has_id_slice = is_id_slice(slices)
+    if not is_id_slice(slices):
+        layout = layout[slices]
+        np_ref = np_ref[slices]
+
+    has_no_strides = stride_kind == StridesKind.IMPLICIT_C and has_id_slice
+    cmp_layouts(layout, np_ref, has_no_strides)
+    layout = layout.broadcast_to(new_shape)
+    np_ref = np.broadcast_to(np_ref, new_shape)
+    cmp_layouts(layout, np_ref, False)
