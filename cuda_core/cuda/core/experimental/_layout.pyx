@@ -109,8 +109,8 @@ cdef class StridedLayout:
 
     def permuted(self, object axis_order):
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
-        cdef axis_order_t axis_order_vec
-        _tuple2axis_order(axis_order_vec, axis_order)
+        cdef axis_vec_t axis_order_vec
+        _tuple2axis_vec(axis_order_vec, axis_order)
         self.permute_into(new_layout, axis_order_vec)
         return new_layout
 
@@ -130,6 +130,28 @@ cdef class StridedLayout:
     def squeezed(self):
         cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
         self.squeeze_into(new_layout)
+        return new_layout
+
+    def unsqueezed(self, object axis):
+        cdef axis_vec_t axis_vec
+        if isinstance(axis, int):
+            axis_vec.push_back(axis)
+        else:
+            _tuple2axis_vec(axis_vec, axis)
+        if axis_vec.size() == 0:
+            return self
+        cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
+        self.unsqueeze_into(new_layout, axis_vec)
+        return new_layout
+
+    def broadcast_to(self, object shape):
+        cdef StridedLayout new_layout = StridedLayout.__new__(StridedLayout)
+        cdef BaseLayout new_shape
+        cdef int new_ndim = len(shape)
+        _init_layout(new_shape, new_ndim)
+        for i in range(new_ndim):
+            new_shape.shape[i] = shape[i]
+        self.broadcast_into(new_layout, new_shape)
         return new_layout
 
     def packed(self, int itemsize, intptr_t data_ptr=0, int axis=-1, bint keep_dim=True):
@@ -190,7 +212,7 @@ cdef class StridedLayout:
         _swap_layout(out_layout.base, new_shape)
         return 0
 
-    cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_order_t& axis_order) except -1 nogil:
+    cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_vec_t& axis_order) except -1 nogil:
         if axis_order.size() != <size_t>self.base.ndim:
             raise ValueError(f"Permutation must have the same length as the number of dimensions, got {axis_order.size()} for {self.ndim}D tensor.")
 
@@ -245,6 +267,40 @@ cdef class StridedLayout:
 
         # Set new attributes
         _swap_layout(out_layout.base, squeezed)
+        return 0
+
+    cdef int unsqueeze_into(StridedLayout self, StridedLayout out_layout, axis_vec_t& axis_vec) except -1 nogil:
+        if axis_vec.size() == 0 and self is out_layout:
+            return 0
+
+        cdef BaseLayout unsqueezed
+        unsqueeze_extents(unsqueezed, self.base, axis_vec)
+
+        # Reset all memoized properties
+        out_layout._prop_mask = 0
+
+        # Preserved attributes
+        out_layout.itemsize = self.itemsize
+        out_layout.slice_offset = self.slice_offset
+        maybe_copy_volume(out_layout, self)
+
+        # Set new attributes
+        _swap_layout(out_layout.base, unsqueezed)
+        return 0
+
+    cdef int broadcast_into(StridedLayout self, StridedLayout out_layout, BaseLayout& broadcast) except -1 nogil:
+        _validate_shape(broadcast)
+        broadcast_extents(broadcast, self.base)
+
+        # Reset all memoized properties
+        out_layout._prop_mask = 0
+
+        # Preserved attributes
+        out_layout.itemsize = self.itemsize
+        out_layout.slice_offset = self.slice_offset
+
+        # Set new attributes
+        _swap_layout(out_layout.base, broadcast)
         return 0
 
     cdef int pack_into(StridedLayout self, StridedLayout out_layout, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=-1) except -1 nogil:
@@ -308,7 +364,6 @@ cdef class StridedLayout:
 
         # Preserved attributes
         out_layout.itemsize = self.itemsize
-        maybe_copy_volume(out_layout, self)
         
         # Set new attributes
         _swap_layout(out_layout.base, sliced)
@@ -316,7 +371,7 @@ cdef class StridedLayout:
         return 0
 
 cdef inline int maybe_copy_volume(StridedLayout out_layout, StridedLayout in_layout) except -1 nogil:
-    if _has_valid_property(out_layout, PROP_VOLUME):
+    if _has_valid_property(in_layout, PROP_VOLUME):
         out_layout._volume = in_layout.get_volume()
         _mark_property_valid(out_layout, PROP_VOLUME)
     return 0
@@ -445,7 +500,7 @@ cdef inline bint split_strides_in_c_index_order(BaseLayout& out_layout, BaseLayo
     return True
 
 
-cdef inline int permute_extents(BaseLayout& out_layout, BaseLayout& in_layout, axis_order_t& axis_order) except -1 nogil:
+cdef inline int permute_extents(BaseLayout& out_layout, BaseLayout& in_layout, axis_vec_t& axis_order) except -1 nogil:
     cdef int ndim = in_layout.ndim
     _init_layout(out_layout, ndim)
     cdef axis_t axis
@@ -537,6 +592,69 @@ cdef inline int squeeze_extents(BaseLayout& out_layout, BaseLayout& in_layout) e
     if out_i != ndim:
         _trim_layout(out_layout, out_i)
     return out_i
+
+
+cdef inline int unsqueeze_extents(BaseLayout& out_layout, BaseLayout& in_layout, axis_vec_t& axis_vec) except -1 nogil:
+    cdef int ndim = in_layout.ndim
+    cdef int num_new_axes = axis_vec.size()
+    cdef int out_ndim = ndim + num_new_axes
+    # _init_layout checks if ndim + num_new_axes is within bounds
+    _init_layout(out_layout, out_ndim)
+    cdef extent_t* in_shape = in_layout.shape
+    cdef stride_t* in_strides = get_strides_ptr(in_layout)
+    cdef axes_mask_t out_shape_mask = 0
+    cdef axes_mask_t axis_mask = 0
+    cdef axis_t axis
+    for i in range(num_new_axes):
+        axis = axis_vec[i]
+        if not _normalize_axis(axis, out_ndim):
+            raise ValueError(f"Invalid axis: {axis} out of range for {out_ndim}D tensor")
+        axis_mask = 1 << axis
+        if out_shape_mask & axis_mask:
+            raise ValueError(f"Axis {axis} appears multiple times.")
+        out_shape_mask |= axis_mask
+    cdef int in_i = 0
+    for i in range(out_ndim):
+        # without the cast, cython has issues with
+        # recognizing 1 << i does not require Python interaction
+        axis_mask = 1 << <int>i
+        if out_shape_mask & axis_mask:
+            out_layout.shape[i] = 1
+            if in_i > 0:
+                out_layout.strides[i] = in_strides[in_i - 1]
+            else:
+                out_layout.strides[i] = _overflow_checked_mul(in_shape[0], in_strides[0])
+        else:
+            out_layout.shape[i] = in_shape[in_i]
+            out_layout.strides[i] = in_strides[in_i]
+            in_i += 1
+    assert in_i == ndim
+    return 0
+
+cdef inline int broadcast_extents(BaseLayout& broadcast, BaseLayout& in_layout) except -1 nogil:
+    if broadcast.ndim < in_layout.ndim:
+        raise ValueError(
+            f"The broadcast shape ndim ({broadcast.ndim}) must be "
+            f"greater than or equal to the input shape "
+            f"ndim ({in_layout.ndim})."
+        )
+    cdef int ndim_diff = broadcast.ndim - in_layout.ndim
+    _zero_strides(broadcast)
+    cdef extent_t* in_shape = in_layout.shape
+    cdef stride_t* in_strides = get_strides_ptr(in_layout)
+    cdef extent_t* broadcast_shape = broadcast.shape + ndim_diff
+    cdef stride_t* broadcast_strides = broadcast.strides + ndim_diff
+    for i in range(in_layout.ndim):
+        if in_shape[i] == broadcast_shape[i]:
+            broadcast_strides[i] = in_strides[i]
+        elif in_shape[i] != 1:
+            raise ValueError(
+                f"Shapes cannot be broadcast together: "
+                f"the original extent must be 1 or be equal to broadcast extent, "
+                f"got {in_shape[i]} and {broadcast_shape[i]} for axis {i}."
+            )
+        # else -> in_extent == 1, the broadcast extent and zero stride are already set
+    return 0
 
 
 cdef inline int64_t gcd(int64_t a, int64_t b) except? -1 nogil:

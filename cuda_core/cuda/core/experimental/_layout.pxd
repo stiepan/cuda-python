@@ -16,7 +16,7 @@ ctypedef uint32_t axes_mask_t  # MUST be exactly STRIDED_LAYOUT_MAX_NDIM bits wi
 ctypedef uint32_t property_mask_t
 
 ctypedef vector.vector[stride_t] extents_strides_t
-ctypedef vector.vector[axis_t] axis_order_t
+ctypedef vector.vector[axis_t] axis_vec_t
 
 from cuda.core.experimental._utils cimport cuda_utils
 
@@ -31,11 +31,11 @@ cdef extern from "include/layout.hpp":
     cdef int STRIDED_LAYOUT_MAX_NDIM
     cdef int AXIS_MASK_ALL
     int64_t _c_abs(int64_t x) nogil
-    void _order_from_strides(axis_order_t& indices, extent_t* extent_t, stride_t* stride_t, int ndim) except + nogil
+    void _order_from_strides(axis_vec_t& indices, extent_t* extent_t, stride_t* stride_t, int ndim) except + nogil
     void _swap(extents_strides_t &a, extents_strides_t &b) noexcept nogil
     void _swap(int64_t* a, int64_t* b) noexcept nogil
     void _swap(int a, int b) noexcept nogil
-    void _swap(axis_order_t &a, axis_order_t &b) noexcept nogil
+    void _swap(axis_vec_t &a, axis_vec_t &b) noexcept nogil
 
 
 cdef enum OrderFlag:
@@ -117,7 +117,7 @@ cdef class StridedLayout:
         _swap_layout(self.base, base)
         return 0
     
-    cdef inline stride_t _init_dense(StridedLayout self, BaseLayout& base, int itemsize, OrderFlag order_flag, axis_order_t* stride_order=NULL) except -1 nogil:
+    cdef inline stride_t _init_dense(StridedLayout self, BaseLayout& base, int itemsize, OrderFlag order_flag, axis_vec_t* stride_order=NULL) except -1 nogil:
         _validate_itemsize(itemsize)
 
         cdef stride_t volume
@@ -144,7 +144,7 @@ cdef class StridedLayout:
         _init_base_layout_from_ptr(base, ndim, shape, strides)
         return self._init(base, itemsize, strides_in_bytes)
     
-    cdef inline int init_dense_from_ptr(StridedLayout self, int ndim, extent_t* shape, int itemsize, OrderFlag order_flag, axis_order_t* stride_order=NULL) except -1 nogil:
+    cdef inline int init_dense_from_ptr(StridedLayout self, int ndim, extent_t* shape, int itemsize, OrderFlag order_flag, axis_vec_t* stride_order=NULL) except -1 nogil:
         cdef BaseLayout base
         _init_base_layout_from_ptr(base, ndim, shape, NULL)
         return self._init_dense(base, itemsize, order_flag, stride_order)
@@ -155,7 +155,7 @@ cdef class StridedLayout:
         return self._init(base, itemsize, strides_in_bytes)
     
     cdef inline int init_dense_from_tuple(StridedLayout self, tuple shape, int itemsize, object stride_order) except -1:
-        cdef axis_order_t stride_order_vec
+        cdef axis_vec_t stride_order_vec
         cdef OrderFlag order_flag = _stride_order2vec(stride_order_vec, stride_order)
         
         if order_flag == ORDER_NONE:
@@ -209,14 +209,14 @@ cdef class StridedLayout:
             _mark_property_valid(self, PROP_VOLUME)
         return self._volume
 
-    cdef inline int get_stride_order(StridedLayout self, axis_order_t& stride_order) except -1 nogil:
+    cdef inline int get_stride_order(StridedLayout self, axis_vec_t& stride_order) except -1 nogil:
         _order_from_strides(stride_order, self.base.shape, self.base.strides, self.base.ndim)
         return 0
     
     cdef inline tuple get_stride_order_tuple(StridedLayout self):
         if _has_valid_property(self, PROP_STRIDE_ORDER):
             return self._py_stride_order
-        cdef axis_order_t stride_order
+        cdef axis_vec_t stride_order
         self.get_stride_order(stride_order)
         self._py_stride_order = cuda_utils.carray_integer_t_to_tuple(stride_order.data(), stride_order.size())
         _mark_property_valid(self, PROP_STRIDE_ORDER)
@@ -227,7 +227,7 @@ cdef class StridedLayout:
             return _boolean_property(self, PROP_IS_UNIQUE)
         if self.base.strides == NULL or self.get_volume() == 0:
             return _set_boolean_property(self, PROP_IS_UNIQUE, True)
-        cdef axis_order_t stride_order
+        cdef axis_vec_t stride_order
         self.get_stride_order(stride_order)
         return _set_boolean_property(self, PROP_IS_UNIQUE, _is_unique(self.base, stride_order))
 
@@ -244,7 +244,7 @@ cdef class StridedLayout:
     cdef inline bint get_is_contiguous_any(StridedLayout self) except -1 nogil:
         if _has_valid_property(self, PROP_IS_CONTIGUOUS_ANY):
             return _boolean_property(self, PROP_IS_CONTIGUOUS_ANY)
-        cdef axis_order_t stride_order
+        cdef axis_vec_t stride_order
         self.get_stride_order(stride_order)
         return _set_boolean_property(self, PROP_IS_CONTIGUOUS_ANY, _is_contiguous_any(self.get_volume(), self.base, stride_order))
     
@@ -298,10 +298,12 @@ cdef class StridedLayout:
 
     
     cdef int reshape_into(StridedLayout self, StridedLayout out_layout, BaseLayout& new_shape) except -1 nogil
-    cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_order_t& axis_order) except -1 nogil
+    cdef int permute_into(StridedLayout self, StridedLayout out_layout, axis_vec_t& axis_order) except -1 nogil
     
     cdef int flatten_into(StridedLayout self, StridedLayout out_layout, axes_mask_t axis_mask=*) except -1 nogil
     cdef int squeeze_into(StridedLayout self, StridedLayout out_layout) except -1 nogil
+    cdef int unsqueeze_into(StridedLayout self, StridedLayout out_layout, axis_vec_t& axis_vec) except -1 nogil
+    cdef int broadcast_into(StridedLayout self, StridedLayout out_layout, BaseLayout& broadcast) except -1 nogil
     cdef int pack_into(StridedLayout self, StridedLayout out_layout, int itemsize, intptr_t data_ptr, bint keep_dim, int axis=*) except -1 nogil
     cdef int unpack_into(StridedLayout self, StridedLayout out_layout, int itemsize, int axis=*) except -1 nogil
     cdef int slice_into(StridedLayout self, StridedLayout out_layout, tuple slices) except -1
@@ -428,7 +430,7 @@ cdef inline stride_t _dense_strides_f(BaseLayout& base) except? -1 nogil:
     return stride
 
 
-cdef inline stride_t _dense_strides_in_order(BaseLayout& base, axis_order_t& stride_order) except? -1 nogil:
+cdef inline stride_t _dense_strides_in_order(BaseLayout& base, axis_vec_t& stride_order) except? -1 nogil:
     cdef int ndim = base.ndim
     if <size_t>ndim != stride_order.size():
         raise ValueError(f"stride_order must have the same length as shape. Shape has {ndim} dimensions, but stride_order has {stride_order.size()} elements.")
@@ -496,7 +498,7 @@ cdef inline bint _is_contiguous_f(int64_t volume, BaseLayout& base) except -1 no
     return True
 
 
-cdef inline bint _is_contiguous_any(int64_t volume, BaseLayout& base, axis_order_t& axis_order) except -1 nogil:
+cdef inline bint _is_contiguous_any(int64_t volume, BaseLayout& base, axis_vec_t& axis_order) except -1 nogil:
     if volume == 0 or base.strides == NULL:
         return True
     cdef int64_t stride = 1
@@ -514,15 +516,20 @@ cdef inline bint _is_contiguous_any(int64_t volume, BaseLayout& base, axis_order
     return True
 
 
+cdef inline int _validate_shape(BaseLayout& base) except -1 nogil:
+    for i in range(base.ndim):
+        if base.shape[i] < 0:
+            raise ValueError("Extents must be non-negative")
+    return 0
+
+
 cdef inline int _init_base_layout_from_tuple(BaseLayout& base, tuple shape, tuple strides) except -1:
     cdef int ndim = len(shape)
     _init_layout(base, ndim)
-    cdef extent_t extent
     for i in range(ndim):
-        extent = shape[i]
-        if extent < 0:
-            raise ValueError("Extents must be non-negative")
-        base.shape[i] = extent
+        base.shape[i] = shape[i]
+    _validate_shape(base)
+
     if strides is None:
         base.strides = NULL
     else:
@@ -535,18 +542,16 @@ cdef inline int _init_base_layout_from_tuple(BaseLayout& base, tuple shape, tupl
 
 cdef inline int _init_base_layout_from_ptr(BaseLayout& base, int ndim, extent_t* shape, stride_t* strides) except -1 nogil:
     _init_layout(base, ndim)
-    cdef extent_t extent
     for i in range(ndim):
-        extent = shape[i]
-        if extent < 0:
-            raise ValueError("Extents must be non-negative")
-        base.shape[i] = extent
+        base.shape[i] = shape[i]
+    _validate_shape(base)
+
     if strides == NULL:
         base.strides = NULL
     else:
         for i in range(ndim):
             base.strides[i] = strides[i]
-
+    return 0
 
 # ==============================
 # Strided layout helpers
@@ -578,18 +583,18 @@ cdef inline bint _set_boolean_property(StridedLayout self, Property prop, bint v
 # Conversion, validation and normalization helpers
 # ==============================
 
-cdef inline OrderFlag _stride_order2vec(axis_order_t& stride_order_vec, object stride_order) except? ORDER_NONE:
+cdef inline OrderFlag _stride_order2vec(axis_vec_t& stride_order_vec, object stride_order) except? ORDER_NONE:
     if stride_order == 'C':
         return ORDER_C
     elif stride_order == 'F':
         return ORDER_F
     elif isinstance(stride_order, tuple | list): 
-        _tuple2axis_order(stride_order_vec, stride_order)
+        _tuple2axis_vec(stride_order_vec, stride_order)
         return ORDER_PERM
     return ORDER_NONE
 
 
-cdef inline int _tuple2axis_order(axis_order_t& vec, object t) except -1:
+cdef inline int _tuple2axis_vec(axis_vec_t& vec, object t) except -1:
     cdef int ndim = len(t)
     vec.resize(ndim)
     for i in range(ndim):
@@ -613,7 +618,7 @@ cdef inline int _validate_itemsize(int itemsize) except -1 nogil:
     return 0
 
 
-cdef inline bint _is_unique(BaseLayout& base, axis_order_t& stride_order) except -1 nogil:
+cdef inline bint _is_unique(BaseLayout& base, axis_vec_t& stride_order) except -1 nogil:
     if base.strides == NULL:
         return True
     cdef int64_t cur_max_offset = 0
