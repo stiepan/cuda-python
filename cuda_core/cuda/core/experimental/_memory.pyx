@@ -44,6 +44,55 @@ DevicePointerT = Union[driver.CUdeviceptr, int, None]
 """A type union of :obj:`~driver.CUdeviceptr`, `int` and `None` for hinting :attr:`Buffer.handle`."""
 
 
+cdef struct _cyMemoryAttributes:
+    int device_id
+    bint is_device_accessible
+    bint is_host_accessible
+    bint inited
+
+
+cdef inline int query_memory_attributes(_cyMemoryAttributes &out, intptr_t ptr) except -1 nogil:
+    cdef cydriver.CUdeviceptr q_ptr = ptr
+    cdef unsigned int memory_type
+    cdef int device_id
+    cdef cydriver.CUpointer_attribute attrs[2]
+    cdef intptr_t vals[2]
+    attrs[0] = cydriver.CUpointer_attribute.CU_POINTER_ATTRIBUTE_MEMORY_TYPE
+    attrs[1] = cydriver.CUpointer_attribute.CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
+    vals[0] = <intptr_t><void*>&memory_type
+    vals[1] = <intptr_t><void*>&device_id
+
+    cdef cydriver.CUresult ret = cydriver.cuPointerGetAttributes(2, attrs, <void**>vals, q_ptr)
+    if ret == cydriver.CUresult.CUDA_ERROR_NOT_INITIALIZED:
+        with cython.gil:
+            # Device class handles the cuInit call internally
+            from cuda.core.experimental import Device
+            Device()
+        ret = cydriver.cuPointerGetAttributes(2, attrs, <void**>vals, q_ptr)
+    HANDLE_RETURN(ret)
+
+    out.device_id = device_id
+
+    if memory_type == 0:
+        # unregistered host pointer
+        out.is_host_accessible = True
+        out.is_device_accessible = False
+    elif (
+        memory_type == cydriver.CUmemorytype.CU_MEMORYTYPE_HOST
+        or memory_type == cydriver.CUmemorytype.CU_MEMORYTYPE_UNIFIED
+    ):
+        # TODO(ktokarski): should we compare host/device ptrs using cuPointerGetAttribute
+        # for exceptional cases when the same data can end up with different ptrs
+        # for host and device?
+        out.is_host_accessible = True
+        out.is_device_accessible = True
+    else:
+        # device/texture
+        out.is_host_accessible = False
+        out.is_device_accessible = True
+    return 0
+
+
 cdef class _cyBuffer:
     """
     Internal only. Responsible for offering fast C method access.
@@ -54,6 +103,8 @@ cdef class _cyBuffer:
         _cyMemoryResource _mr
         object _ptr_obj
         cyStream _alloc_stream
+        object _owner
+        _cyMemoryAttributes _mem_attrs
 
 
 cdef class _cyMemoryResource:
@@ -111,18 +162,23 @@ cdef class Buffer(_cyBuffer, MemoryResourceAttributes):
         self._mr = None
         self._ptr_obj = None
         self._alloc_stream = None
+        self._owner = None
+        self._mem_attrs.inited = False
 
     def __init__(self, *args, **kwargs):
         raise RuntimeError("Buffer objects cannot be instantiated directly. Please use MemoryResource APIs.")
 
     @classmethod
-    def _init(cls, ptr: DevicePointerT, size_t size, mr: MemoryResource | None = None, stream: Stream | None = None):
+    def _init(cls, ptr: DevicePointerT, size_t size, mr: MemoryResource | None = None, stream: Stream | None = None, owner: object | None = None):
         cdef Buffer self = Buffer.__new__(cls)
         self._ptr = <intptr_t>(int(ptr))
         self._ptr_obj = ptr
         self._size = size
         self._mr = mr
         self._alloc_stream = <cyStream>(stream) if stream is not None else None
+        self._owner = owner
+        if mr is not None and owner is not None:
+            raise ValueError("owner and memory resource cannot be both specified together")
         return self
 
     def __dealloc__(self):
@@ -188,25 +244,39 @@ cdef class Buffer(_cyBuffer, MemoryResourceAttributes):
         return self._mr
 
     @property
+    def owner(self) -> object:
+        """Return the owner of this buffer."""
+        return self._owner
+
+    @property
     def is_device_accessible(self) -> bool:
         """Return True if this buffer can be accessed by the GPU, otherwise False."""
         if self._mr is not None:
             return self._mr.is_device_accessible
-        raise NotImplementedError("WIP: Currently this property only supports buffers with associated MemoryResource")
+        else:
+            if not self._mem_attrs.inited:
+                query_memory_attributes(self._mem_attrs, self._ptr)
+            return self._mem_attrs.is_device_accessible
 
     @property
     def is_host_accessible(self) -> bool:
         """Return True if this buffer can be accessed by the CPU, otherwise False."""
         if self._mr is not None:
             return self._mr.is_host_accessible
-        raise NotImplementedError("WIP: Currently this property only supports buffers with associated MemoryResource")
+        else:
+            if not self._mem_attrs.inited:
+                query_memory_attributes(self._mem_attrs, self._ptr)
+            return self._mem_attrs.is_host_accessible
 
     @property
     def device_id(self) -> int:
         """Return the device ordinal of this buffer."""
         if self._mr is not None:
             return self._mr.device_id
-        raise NotImplementedError("WIP: Currently this property only supports buffers with associated MemoryResource")
+        else:
+            if not self._mem_attrs.inited:
+                query_memory_attributes(self._mem_attrs, self._ptr)
+            return self._mem_attrs.device_id
 
     def get_ipc_descriptor(self) -> IPCBufferDescriptor:
         """Export a buffer allocated for sharing between processes."""
@@ -313,7 +383,7 @@ cdef class Buffer(_cyBuffer, MemoryResourceAttributes):
             if not isinstance(max_version, tuple) or len(max_version) != 2:
                 raise BufferError(f"Expected max_version tuple[int, int], got {max_version}")
             versioned = max_version >= (1, 0)
-        capsule = make_py_capsule(self, versioned)
+        capsule = make_py_capsule(self, int(self.handle), versioned)
         return capsule
 
     def __dlpack_device__(self) -> tuple[int, int]:
@@ -340,7 +410,7 @@ cdef class Buffer(_cyBuffer, MemoryResourceAttributes):
         raise NotImplementedError("WIP: Buffer.__release_buffer__ hasn't been implemented yet.")
 
     @staticmethod
-    def from_handle(ptr: DevicePointerT, size_t size, mr: MemoryResource | None = None) -> Buffer:
+    def from_handle(ptr: DevicePointerT, size_t size, mr: MemoryResource | None = None, owner: object | None = None) -> Buffer:
         """Create a new :class:`Buffer` object from a pointer.
 
         Parameters
@@ -353,7 +423,7 @@ cdef class Buffer(_cyBuffer, MemoryResourceAttributes):
             Memory resource associated with the buffer
         """
         # TODO: It is better to take a stream for latter deallocation
-        return Buffer._init(ptr, size, mr=mr)
+        return Buffer._init(ptr, size, mr=mr, owner=owner)
 
 
 cdef class MemoryResource(_cyMemoryResource, MemoryResourceAttributes, abc.ABC):
